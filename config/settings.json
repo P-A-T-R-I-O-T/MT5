@@ -1,0 +1,26 @@
+{
+  "system": {
+    "shutdown_command": "0",
+    "connection_monitor_interval": 30,
+    "reconnection_delays": [0, 10, 30, 60, 300]
+  },
+  "display": {
+    "terminal_info": true,
+    "account_info": true,
+    "all_symbols": true,
+    "symbol_details": false,
+    "grouped_symbols": false
+  },
+  "history": {
+    "enabled": true,
+    "start_date": "2026-04-06",
+    "end_date": "2026-05-20",
+    "timeframe": "M1",
+    "symbols": ["GBPUSD", "EURUSD"],
+    "mode": "custom",
+    "symbols_directories": "off"
+  }
+}
+
+
+

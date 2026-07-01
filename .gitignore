@@ -1,0 +1,12 @@
+mt5_env/
+history/
+test/
+__pycache__/
+logs/
+credentials.json
+credentials.txt
+данные.txt
+project.txt
+scan.py
+__init__.py
+symbols_list.json
