@@ -1,12 +1,10 @@
 # main.py
 
-
 from src.core.mt5_connection import MT5Connection
 from src.utils.symbol_utils import group_and_display_symbols
 from src.core.mt5_symbol import MT5Symbol
 from src.utils.history_manager import HistoryManager
 from src.utils.json_manager import JsonManager
-
 
 
 def main():
@@ -24,7 +22,6 @@ def main():
             print("Успешно подключились к MT5")
             mt5_conn._start_connection_monitor()  # Запускаем мониторинг подключения
         else:
-            print("Не удалось подключиться к MT5")
             return
 
         # Основной цикл с проверкой команды отключения
@@ -36,10 +33,10 @@ def main():
                 _execute_trading_operations(
                     mt5_conn,
                     json_manager,
-            display_settings,
-            history_settings,
-            symbols_directories
-        )
+                    display_settings,
+                    history_settings,
+                    symbols_directories
+                )
 
                 # Проверяем команду отключения (ввод пользователя)
                 user_input = input("\nВведите команду (или нажмите Enter для продолжения): ").strip()
@@ -58,9 +55,9 @@ def main():
             except KeyboardInterrupt:
                 print("\nПрервано пользователем")
                 break
-            except Exception as e:
-                print(f"Ошибка в операционном цикле: {str(e)}")
-                # Продолжаем работу — мониторинг и переподключение продолжат работать
+    except Exception as e:
+        print(f"Ошибка в операционном цикле: {str(e)}")
+        # Продолжаем работу — мониторинг и переподключение продолжат работать
 
     except KeyboardInterrupt:
         print("\nПрервано пользователем")
@@ -70,56 +67,70 @@ def main():
         mt5_conn.disconnect()  # Гарантированное отключение и остановка мониторинга
         print("Система корректно завершена.")
 
+
 def _execute_trading_operations(mt5_conn, json_manager, display_settings, history_settings, symbols_directories):
     """Выполняет все торговые операции."""
     # Информация о терминале
+    terminal_info = None
     if display_settings.get('terminal_info', True):
         terminal_info = mt5_conn.get_terminal_info()
-        if terminal_info:
-            print("\nИнформация о терминале:")
-            print(f"  Версия терминала: {terminal_info['build']}")
-            print(f"  Название: {terminal_info['name']}")
+    if terminal_info:
+        print("\nИнформация о терминале:")
+        print(f" Версия терминала: {terminal_info['build']}")
+        print(f" Название: {terminal_info['name']}")
 
     # Информация о счёте
+    account_info = None
     if display_settings.get('account_info', True):
         account_info = mt5_conn.get_account_info()
-        if account_info:
-            print("\nИнформация о счёте:")
-            print(f"  Логин: {account_info['login']}")
-            print(f"  Баланс: {account_info['balance']} {account_info['currency']}")
-            print(f"  Эквити: {account_info['equity']} {account_info['currency']}")
+    if account_info:
+        print("\nИнформация о счёте:")
+        print(f" Логин: {account_info['login']}")
+        print(f" Баланс: {account_info['balance']} {account_info['currency']}")
+        print(f" Эквити: {account_info['equity']} {account_info['currency']}")
 
     # Работа с символами
+    symbols = []
     if display_settings.get('all_symbols', True):
         symbols = mt5_conn.symbols_get()
-        if symbols:
-            json_manager.save_symbols_to_json(symbols)
-            if display_settings.get('grouped_symbols', True):
-                group_and_display_symbols(symbols)
-            mt5_symbols = [MT5Symbol(symbol) for symbol in symbols]
-            results = MT5Symbol.create_all_directories(mt5_symbols, symbols_directories)
-            print(f"Создано директорий: {len(results['created'])}")
-            print(f"Уже существовали: {len(results['already_existed'])}")
-            if results['errors']:
-                print(f"Ошибки при создании: {len(results['errors'])}")
-        else:
-            print("Список символов пуст")
+
+    if symbols:
+        json_manager.save_symbols_to_json(symbols)
+
+    results = None  # Гарантируем существование переменной
+
+    if display_settings.get('grouped_symbols', True) and symbols:
+        group_and_display_symbols(symbols)
+        mt5_symbols = [MT5Symbol(symbol) for symbol in symbols]
+        results = MT5Symbol.create_all_directories(mt5_symbols, symbols_directories)
+
+        print(f"\nСоздано директорий: {len(results['created'])}")
+        print(f"Уже существовали: {len(results['already_existed'])}")
+
+        if results['errors']:
+            print(f"Ошибки при создании: {len(results['errors'])}")
+    elif not symbols:
+        print("\nСписок символов пуст")
+    else:
+        # Если grouped_symbols=False, но символы есть — просто сообщаем, что группировка отключена
+        print("\nГруппировка и создание директорий отключены (display.grouped_symbols = False)")
 
     # Проверка согласованности настроек символов
     history_symbols = history_settings.get('symbols', [])
-    if symbols_directories != 'all' and set(history_symbols) != set(symbols_directories):
+    if symbols_directories != 'all' and isinstance(symbols_directories, list) and set(history_symbols) != set(symbols_directories):
         print("ПРЕДУПРЕЖДЕНИЕ: Настройки 'symbols' и 'symbols_directories' не согласованы!")
-        print(f"  'symbols': {history_symbols}")
-        print(f"  'symbols_directories': {symbols_directories}")
-        print("  Рекомендуется привести их к одинаковым значениям.")
+        print(f" 'symbols': {history_symbols}")
+        print(f" 'symbols_directories': {symbols_directories}")
+        print(" Рекомендуется привести их к одинаковым значениям.")
 
     # Загрузка исторических данных (если включено в настройках)
     if history_settings.get('enabled', False):
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("ЗАГРУЗКА ИСТОРИЧЕСКИХ ДАННЫХ")
-        print("="*60)
+        print("=" * 60)
         HistoryManager.download_and_save_history(mt5_conn, history_settings)
 
 
 if __name__ == "__main__":
     main()
+0
