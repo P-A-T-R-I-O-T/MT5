@@ -226,7 +226,7 @@ def _user_input_loop(worker: WorkerMT5Task, shutdown_command: str):
             settings = worker.json_manager.load_settings()
             history_settings = settings.get('history', {})
             
-            if not history_settings.get('enabled', False):0
+            if not history_settings.get('enabled', False):
                 print("Сбор реальных данных отключен в настройках")
                 continue
             
