@@ -19,8 +19,7 @@ def main():
     shutdown_command = json_manager.get_shutdown_command()
     
     # Проверяем настройки реального времени
-    realtime_settings = history_settings.get('realtime', {})
-    realtime_enabled = realtime_settings.get('enabled', False)
+    realtime_enabled = history_settings.get('enabled', False)
 
     # Инициализируем воркер
     worker = WorkerMT5Task(json_manager)
@@ -226,9 +225,8 @@ def _user_input_loop(worker: WorkerMT5Task, shutdown_command: str):
             # Проверяем настройки перед запуском
             settings = worker.json_manager.load_settings()
             history_settings = settings.get('history', {})
-            realtime_settings = history_settings.get('realtime', {})
             
-            if not realtime_settings.get('enabled', False):
+            if not history_settings.get('enabled', False):0
                 print("Сбор реальных данных отключен в настройках")
                 continue
             

@@ -154,9 +154,8 @@ class WorkerMT5Task:
             # Проверяем настройки перед запуском
             settings = self.json_manager.load_settings()
             history_settings = settings.get('history', {})
-            realtime_settings = history_settings.get('realtime', {})
             
-            if not realtime_settings.get('enabled', False):
+            if not history_settings.get('enabled', False):
                 print("[WorkerMT5Task] Сбор реальных данных отключен в настройках")
                 if task.result_callback:
                     task.result_callback({"status": "realtime_disabled"})

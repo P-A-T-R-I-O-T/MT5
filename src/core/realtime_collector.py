@@ -35,15 +35,11 @@ class RealtimeCollector:
         # Настройки
         settings = json_manager.load_settings()
         history_settings = settings.get('history', {})
-        realtime_settings = history_settings.get('realtime', {})
+        
         
         # Используем символы из realtime или из общего списка
-        self._symbols = realtime_settings.get('symbols', [])
-        if not self._symbols:
-            self._symbols = history_settings.get('symbols', [])
-        
-        # Таймфрейм из настроек
-        timeframe_str = realtime_settings.get('timeframe', 'M1')
+        self._symbols = history_settings.get('symbols', [])
+        timeframe_str = history_settings.get('timeframe', 'M1')
         self._timeframe = self._get_timeframe(timeframe_str)
         
         # Путь для сохранения
