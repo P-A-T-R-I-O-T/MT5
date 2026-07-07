@@ -27,6 +27,7 @@ class RealtimeCollector:
         self._buffer_size = 100  # Записываем в файл каждые 100 свечей
         self._last_save_time = datetime.utcnow()
         self._save_interval = timedelta(minutes=5)  # Или каждые 5 минут
+        self._stop_requested = False  # Флаг для быстрой остановки
         
         # Настройки
         settings = json_manager.load_settings()
@@ -109,60 +110,87 @@ class RealtimeCollector:
             return
         
         self._running = True
+        self._stop_requested = False
         self._thread = threading.Thread(target=self._collect_loop, daemon=True)
         self._thread.start()
         print(f"[RealtimeCollector] Запущен для {len(self._symbols)} символов")
     
     def stop(self):
         """Останавливает сбор данных и сохраняет буфер."""
+        print("[RealtimeCollector] Запрос остановки...")
+        self._stop_requested = True
         self._running = False
+        
         if self._thread:
-            self._thread.join(timeout=5)
+            # Ждем завершения потока с таймаутом
+            self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                print("[RealtimeCollector] Поток не завершился, принудительная остановка...")
+        
         # Сохраняем остатки буфера
         self._flush_buffer()
         print("[RealtimeCollector] Остановлен")
     
     def _collect_loop(self):
         """Основной цикл сбора данных с синхронизацией по UTC."""
-        # Ждем начала следующей минуты для синхронизации
-        self._sync_to_next_minute()
-        
-        while self._running:
-            try:
-                # Проверяем подключение
-                if not self._check_connection():
-                    time.sleep(30)
-                    continue
-                
-                # Собираем данные за последние минуты с запасом
-                self._collect_recent_data()
-                
-                # Сохраняем буфер при необходимости
-                self._check_and_save_buffer()
-                
-                # Ждем до следующей минуты
-                self._wait_until_next_minute()
-                
-            except Exception as e:
-                print(f"[RealtimeCollector] Ошибка в цикле сбора: {e}")
-                time.sleep(10)
+        try:
+            # Ждем начала следующей минуты для синхронизации
+            self._sync_to_next_minute()
+            
+            while self._running and not self._stop_requested:
+                try:
+                    # Проверяем подключение
+                    if not self._check_connection():
+                        if self._stop_requested:
+                            break
+                        time.sleep(30)
+                        continue
+                    
+                    # Собираем данные за последние минуты с запасом
+                    self._collect_recent_data()
+                    
+                    # Сохраняем буфер при необходимости
+                    self._check_and_save_buffer()
+                    
+                    # Ждем до следующей минуты, но проверяем флаг остановки
+                    self._wait_until_next_minute()
+                    
+                except Exception as e:
+                    print(f"[RealtimeCollector] Ошибка в цикле сбора: {e}")
+                    if self._stop_requested:
+                        break
+                    time.sleep(10)
+        except Exception as e:
+            print(f"[RealtimeCollector] Критическая ошибка в цикле: {e}")
+        finally:
+            # Сохраняем буфер при выходе
+            self._flush_buffer()
+            print("[RealtimeCollector] Цикл сбора завершен")
     
     def _sync_to_next_minute(self):
         """Синхронизирует начало работы с началом следующей минуты."""
         now = datetime.utcnow()
         next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
         wait_seconds = (next_minute - now).total_seconds()
-        if wait_seconds > 0:
+        if wait_seconds > 0 and wait_seconds < 60:  # Не ждем больше минуты
             print(f"[RealtimeCollector] Синхронизация: ожидание {wait_seconds:.1f} секунд")
-            time.sleep(wait_seconds)
+            # Проверяем флаг остановки во время ожидания
+            for _ in range(int(wait_seconds)):
+                if self._stop_requested:
+                    return
+                time.sleep(1)
     
     def _wait_until_next_minute(self):
-        """Ожидает до начала следующей минуты."""
+        """Ожидает до начала следующей минуты с проверкой флага остановки."""
         now = datetime.utcnow()
         next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
         wait_seconds = (next_minute - now).total_seconds()
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
+        if wait_seconds > 0 and wait_seconds < 60:
+            # Проверяем флаг остановки во время ожидания
+            for _ in range(int(wait_seconds)):
+                if self._stop_requested:
+                    return
+                time.sleep(1)
     
     def _check_connection(self) -> bool:
         """Проверяет подключение к MT5."""
@@ -191,6 +219,10 @@ class RealtimeCollector:
         all_new_data = []
         
         for symbol in self._symbols:
+            # Проверяем флаг остановки
+            if self._stop_requested:
+                break
+                
             try:
                 # Получаем данные с запасом
                 rates = mt5.copy_rates_range(
@@ -222,12 +254,15 @@ class RealtimeCollector:
                 print(f"[RealtimeCollector] Ошибка для {symbol}: {e}")
         
         # Добавляем в буфер
-        if all_new_data:
+        if all_new_data and not self._stop_requested:
             with self._lock:
                 self._buffer.extend(all_new_data)
     
     def _check_and_save_buffer(self):
         """Проверяет буфер и сохраняет при необходимости."""
+        if self._stop_requested:
+            return
+            
         should_save = False
         
         with self._lock:
@@ -328,7 +363,8 @@ class RealtimeCollector:
                 return {
                     'total_records': 0,
                     'symbols': [],
-                    'buffer_size': sum(len(df) for df in self._buffer)
+                    'buffer_size': sum(len(df) for df in self._buffer),
+                    'is_running': self._running
                 }
             
             return {
@@ -337,5 +373,6 @@ class RealtimeCollector:
                 'start_time': self._existing_data['time'].min(),
                 'end_time': self._existing_data['time'].max(),
                 'buffer_size': sum(len(df) for df in self._buffer),
-                'records_by_symbol': self._existing_data['symbol'].value_counts().to_dict()
+                'records_by_symbol': self._existing_data['symbol'].value_counts().to_dict(),
+                'is_running': self._running
             }

@@ -44,7 +44,9 @@ class WorkerMT5Task:
 
     def stop(self):
         """Корректная остановка с освобождением всех ресурсов."""
+        print("[WorkerMT5Task] Начало остановки...")
         self._stop_flag = True
+        self._is_running = False
         
         # Останавливаем сбор реального времени
         if self.realtime_collector:
@@ -54,12 +56,14 @@ class WorkerMT5Task:
         
         # Ожидаем завершения потока
         if self._thread:
+            print("[WorkerMT5Task] Ожидание завершения потока...")
             self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                print("[WorkerMT5Task] Поток не завершился, продолжаем...")
         
         # Отключаемся от MT5
         self.mt5_conn.disconnect()
         
-        self._is_running = False
         print("[WorkerMT5Task] Остановлен")
 
     def submit(self, task: MT5Task):
@@ -70,11 +74,17 @@ class WorkerMT5Task:
         """Основной цикл обработки задач."""
         while not self._stop_flag:
             try:
-                task = self._queue.get(timeout=1.0)
+                task = self._queue.get(timeout=0.5)  # Меньший таймаут для быстрой реакции на остановку
             except queue.Empty:
                 continue
 
             try:
+                # Проверяем флаг остановки перед выполнением задачи
+                if self._stop_flag:
+                    print("[WorkerMT5Task] Пропуск задачи из-за флага остановки")
+                    self._queue.task_done()
+                    break
+                    
                 self._execute_task(task)
             except Exception as e:
                 if task.error_callback:
@@ -83,6 +93,8 @@ class WorkerMT5Task:
                     print(f"[WorkerMT5Task] Необработанная ошибка задачи: {e}")
             finally:
                 self._queue.task_done()
+        
+        print("[WorkerMT5Task] Цикл обработки задач завершен")
 
     def _execute_task(self, task: MT5Task):
         """Выполняет конкретную задачу."""

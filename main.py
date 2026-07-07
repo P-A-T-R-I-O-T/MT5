@@ -28,8 +28,12 @@ def main():
 
     print("\n[Main] Воркер MT5 запущен. Поток задач активен.")
 
+    # Флаг для управления главным циклом
+    system_running = True
+
     # 1) Сначала отправляем задачу на подключение
     def on_connect_result(res: Dict[str, Any]):
+        nonlocal system_running
         connected = res.get("connected", False)
         if connected:
             print("[Main] MT5 подключён. Начинаем выполнение операций.")
@@ -47,6 +51,7 @@ def main():
                 print("[Main] Сбор реальных данных отключен в настройках")
         else:
             print("[Main] Не удалось подключиться к MT5. Остановка.")
+            system_running = False
             worker.stop()
 
     worker.submit(MT5Task(
@@ -64,9 +69,15 @@ def main():
     input_thread.start()
 
     try:
-        # Держим главный поток живым, пока работает воркер
-        while worker._is_running or input_thread.is_alive():
+        # Держим главный поток живым, пока работает система
+        while system_running and (worker._is_running or input_thread.is_alive()):
             time.sleep(1)
+            
+            # Проверяем, не был ли установлен флаг остановки в воркере
+            if worker._stop_flag:
+                print("[Main] Обнаружен флаг остановки, завершаем работу...")
+                system_running = False
+                break
             
             # Периодически выводим статистику сбора (для отладки)
             if realtime_enabled and worker.realtime_collector:
@@ -186,7 +197,10 @@ def _user_input_loop(worker: WorkerMT5Task, shutdown_command: str):
 
         if user_input.lower() == shutdown_command.lower():
             print("Получена команда отключения системы...")
+            # Устанавливаем флаг остановки в воркере
             worker._stop_flag = True
+            # Ждем немного, чтобы дать возможность завершиться другим потокам
+            time.sleep(0.5)
             break
         elif user_input == "stats":
             # Показываем статистику сбора
@@ -202,16 +216,32 @@ def _user_input_loop(worker: WorkerMT5Task, shutdown_command: str):
                 print("Сбор данных не запущен")
         elif user_input == "realtime stop":
             if worker.realtime_collector:
+                # Останавливаем сбор напрямую, без отправки задачи в очередь
                 worker.realtime_collector.stop()
+                worker.realtime_collector = None
                 print("Сбор данных остановлен")
             else:
                 print("Сбор данных не запущен")
         elif user_input == "realtime start":
+            # Проверяем настройки перед запуском
+            settings = worker.json_manager.load_settings()
+            history_settings = settings.get('history', {})
+            realtime_settings = history_settings.get('realtime', {})
+            
+            if not realtime_settings.get('enabled', False):
+                print("Сбор реальных данных отключен в настройках")
+                continue
+            
             worker.submit(MT5Task(
                 task_type="start_realtime",
                 result_callback=lambda res: print("Сбор данных запущен"),
                 error_callback=lambda e: print(f"Ошибка запуска: {e}")
             ))
+        elif user_input == "exit":
+            print("Выход из программы...")
+            worker._stop_flag = True
+            time.sleep(0.5)
+            break
         elif not user_input:
             continue
         else:
@@ -220,6 +250,7 @@ def _user_input_loop(worker: WorkerMT5Task, shutdown_command: str):
             print("  stats - статистика сбора данных")
             print("  realtime start - запустить сбор данных")
             print("  realtime stop - остановить сбор данных")
+            print("  exit - выход из программы")
 
 
 if __name__ == "__main__":
