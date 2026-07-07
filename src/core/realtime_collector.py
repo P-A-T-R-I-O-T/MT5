@@ -12,7 +12,7 @@ from src.utils.json_manager import JsonManager
 
 
 class RealtimeCollector:
-    """Класс для сбора данных в реальном времени с правильной синхронизацией."""
+    """Класс для сбора данных в реальном времени с конвертацией в UTC."""
     
     def __init__(self, mt5_conn, json_manager: JsonManager):
         self.mt5_conn = mt5_conn
@@ -28,6 +28,9 @@ class RealtimeCollector:
         self._last_save_time = datetime.utcnow()
         self._save_interval = timedelta(minutes=5)  # Или каждые 5 минут
         self._stop_requested = False  # Флаг для быстрой остановки
+        
+        # Кэшируем смещение времени сервера
+        self._server_offset = None
         
         # Настройки
         settings = json_manager.load_settings()
@@ -208,15 +211,84 @@ class RealtimeCollector:
         except:
             return False
     
+    def _get_server_timezone_offset(self) -> int:
+        """
+        Определяет смещение времени сервера MT5 относительно UTC.
+        Возвращает количество часов (например, 2 или 3).
+        Результат кэшируется для ускорения.
+        """
+        if self._server_offset is not None:
+            return self._server_offset
+        
+        try:
+            # Пробуем получить время сервера через тик
+            tick = mt5.symbol_info_tick("EURUSD")
+            if tick and tick.time:
+                server_time = datetime.fromtimestamp(tick.time)
+                utc_time = datetime.utcnow()
+                
+                # Вычисляем разницу в часах
+                diff = (server_time - utc_time).total_seconds() / 3600
+                offset = round(diff)
+                
+                # Для форекс брокеров обычно 2 или 3
+                if offset in [2, 3]:
+                    print(f"[RealtimeCollector] Определено смещение сервера: GMT+{offset}")
+                    self._server_offset = offset
+                    return offset
+                else:
+                    print(f"[RealtimeCollector] Обнаружено нестандартное смещение: GMT+{offset}, используем 3")
+                    self._server_offset = 3
+                    return 3
+        except Exception as e:
+            print(f"[RealtimeCollector] Ошибка определения смещения: {e}")
+        
+        # По умолчанию для большинства форекс брокеров - GMT+3 (лето) или GMT+2 (зима)
+        # Определяем по текущей дате
+        now = datetime.utcnow()
+        # В Европе летнее время с последнего воскресенья марта по последнее воскресенье октября
+        is_summer = self._is_european_summer_time(now)
+        offset = 3 if is_summer else 2
+        print(f"[RealtimeCollector] Используем смещение по умолчанию: GMT+{offset} (летнее время: {is_summer})")
+        self._server_offset = offset
+        return offset
+    
+    def _is_european_summer_time(self, dt: datetime) -> bool:
+        """Проверяет, является ли дата европейским летним временем."""
+        year = dt.year
+        # Последнее воскресенье марта
+        last_sunday_march = self._get_last_sunday(year, 3)
+        # Последнее воскресенье октября
+        last_sunday_october = self._get_last_sunday(year, 10)
+        
+        return last_sunday_march <= dt <= last_sunday_october
+    
+    def _get_last_sunday(self, year: int, month: int) -> datetime:
+        """Возвращает дату последнего воскресенья в указанном месяце."""
+        from datetime import date
+        # Последний день месяца
+        if month == 12:
+            last_day = date(year, month, 31)
+        else:
+            last_day = date(year, month + 1, 1) - timedelta(days=1)
+        
+        # Ищем воскресенье
+        while last_day.weekday() != 6:  # 6 - воскресенье
+            last_day -= timedelta(days=1)
+        
+        return datetime(last_day.year, last_day.month, last_day.day)
+    
     def _collect_recent_data(self):
-        """Собирает свечи за последние несколько минут с запасом."""
+        """Собирает свечи за последние несколько минут и конвертирует в UTC."""
         now = datetime.utcnow()
         
-        # Берем с запасом в 5 минут, чтобы не пропустить данные
-        start_time = now - timedelta(minutes=5)
-        end_time = now
+        # Получаем последние 10 свечей для каждого символа с запасом
+        count = 10  # Запрашиваем 10 свечей
         
         all_new_data = []
+        
+        # Получаем смещение сервера один раз
+        server_offset = self._get_server_timezone_offset()
         
         for symbol in self._symbols:
             # Проверяем флаг остановки
@@ -224,12 +296,12 @@ class RealtimeCollector:
                 break
                 
             try:
-                # Получаем данные с запасом
-                rates = mt5.copy_rates_range(
+                # Получаем последние N свечей
+                rates = mt5.copy_rates_from_pos(
                     symbol,
                     self._timeframe,
-                    start_time,
-                    end_time
+                    0,  # Начинаем с последней свечи
+                    count
                 )
                 
                 if rates is None or len(rates) == 0:
@@ -237,18 +309,31 @@ class RealtimeCollector:
                 
                 # Конвертируем в DataFrame
                 df = pd.DataFrame(rates)
+                
+                # КЛЮЧЕВОЙ МОМЕНТ: Конвертируем время в UTC
+                # MT5 возвращает время в секундах с 1970-01-01 в локальном времени сервера
+                # Мы переводим это в UTC, используя смещение сервера
                 df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+                
+                # Корректируем время: вычитаем смещение, чтобы получить UTC
+                # Если сервер в GMT+3, то вычитаем 3 часа
+                df['time'] = df['time'] - pd.Timedelta(hours=server_offset)
+                
                 df['symbol'] = symbol
                 
                 # Фильтруем только новые данные
                 last_time = self._last_times.get(symbol)
                 if last_time:
+                    # Для сравнения используем UTC время
                     df = df[df['time'] > last_time]
                 
                 if not df.empty:
                     all_new_data.append(df)
                     self._last_times[symbol] = df['time'].max()
-                    print(f"[RealtimeCollector] {symbol}: получено {len(df)} новых свечей")
+                    # Выводим пример времени для отладки
+                    sample_time = df['time'].iloc[0]
+                    print(f"[RealtimeCollector] {symbol}: получено {len(df)} новых свечей, "
+                          f"последняя в {sample_time.strftime('%H:%M:%S')} UTC")
                     
             except Exception as e:
                 print(f"[RealtimeCollector] Ошибка для {symbol}: {e}")
@@ -374,5 +459,6 @@ class RealtimeCollector:
                 'end_time': self._existing_data['time'].max(),
                 'buffer_size': sum(len(df) for df in self._buffer),
                 'records_by_symbol': self._existing_data['symbol'].value_counts().to_dict(),
-                'is_running': self._running
+                'is_running': self._running,
+                'server_offset': self._server_offset
             }

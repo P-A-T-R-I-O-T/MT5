@@ -93,15 +93,15 @@ def main():
     finally:
         print("[Main] Завершение работы...")
         
-        # Останавливаем сбор реального времени
-        if worker.realtime_collector:
-            print("[Main] Остановка сбора реальных данных...")
-            worker.submit(MT5Task(
-                task_type="stop_realtime",
-                result_callback=lambda res: print("[Main] Сбор реальных данных остановлен"),
-                error_callback=lambda e: print(f"[Main] Ошибка остановки сбора: {e}")
-            ))
-            time.sleep(2)  # Даем время на сохранение буфера
+        # # Останавливаем сбор реального времени
+        # if worker.realtime_collector:
+        #     print("[Main] Остановка сбора реальных данных...")
+        #     worker.submit(MT5Task(
+        #         task_type="stop_realtime",
+        #         result_callback=lambda res: print("[Main] Сбор реальных данных остановлен"),
+        #         error_callback=lambda e: print(f"[Main] Ошибка остановки сбора: {e}")
+        #     ))
+        #     time.sleep(2)  # Даем время на сохранение буфера
         
         # Останавливаем воркер
         worker.stop()

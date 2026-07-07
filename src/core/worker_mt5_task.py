@@ -74,7 +74,7 @@ class WorkerMT5Task:
         """Основной цикл обработки задач."""
         while not self._stop_flag:
             try:
-                task = self._queue.get(timeout=0.5)  # Меньший таймаут для быстрой реакции на остановку
+                task = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -82,7 +82,8 @@ class WorkerMT5Task:
                 # Проверяем флаг остановки перед выполнением задачи
                 if self._stop_flag:
                     print("[WorkerMT5Task] Пропуск задачи из-за флага остановки")
-                    self._queue.task_done()
+                    # Выходим из цикла, не вызывая task_done(),
+                    # так как задача уже извлечена из очереди
                     break
                     
                 self._execute_task(task)
@@ -92,7 +93,22 @@ class WorkerMT5Task:
                 else:
                     print(f"[WorkerMT5Task] Необработанная ошибка задачи: {e}")
             finally:
-                self._queue.task_done()
+                # Вызываем task_done() только если задача была обработана
+                # Проверяем, что мы не вышли из-за stop_flag
+                if not self._stop_flag:
+                    self._queue.task_done()
+                else:
+                    # Если мы вышли из-за stop_flag, задача уже не нужна
+                    # и task_done() вызывать не нужно, так как мы не будем 
+                    # дожидаться завершения всех задач
+                    pass
+        
+        # Очищаем очередь при выходе
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
         
         print("[WorkerMT5Task] Цикл обработки задач завершен")
 
