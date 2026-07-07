@@ -18,7 +18,12 @@
     "timeframe": "M1",
     "symbols": ["GBPUSD", "EURUSD"],
     "mode": "custom",
-    "symbols_directories": "off"
+    "symbols_directories": "off",
+    "realtime": {
+    "enabled": true,
+    "timeframe": "M1",
+    "symbols": ["GBPUSD", "EURUSD"]
+    }
   }
 }
 

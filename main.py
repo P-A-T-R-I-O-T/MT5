@@ -1,9 +1,12 @@
 # main.py
 
-from src.core.mt5_connection import MT5Connection
+import threading
+import time
+from typing import Callable, Any, Dict
+
+from src.core.worker_mt5_task import WorkerMT5Task, MT5Task
 from src.utils.symbol_utils import group_and_display_symbols
 from src.core.mt5_symbol import MT5Symbol
-from src.utils.history_manager import HistoryManager
 from src.utils.json_manager import JsonManager
 
 
@@ -14,123 +17,210 @@ def main():
     history_settings = json_manager.get_history_settings()
     symbols_directories = json_manager.get_symbols_directories()
     shutdown_command = json_manager.get_shutdown_command()
+    
+    # Проверяем настройки реального времени
+    realtime_settings = history_settings.get('realtime', {})
+    realtime_enabled = realtime_settings.get('enabled', False)
 
-    mt5_conn = MT5Connection(json_manager)
+    # Инициализируем воркер
+    worker = WorkerMT5Task(json_manager)
+    worker.start()
+
+    print("\n[Main] Воркер MT5 запущен. Поток задач активен.")
+
+    # 1) Сначала отправляем задачу на подключение
+    def on_connect_result(res: Dict[str, Any]):
+        connected = res.get("connected", False)
+        if connected:
+            print("[Main] MT5 подключён. Начинаем выполнение операций.")
+            _schedule_initial_operations(worker, display_settings, history_settings, symbols_directories)
+            
+            # Запускаем сбор данных в реальном времени, если включен
+            if realtime_enabled:
+                print("[Main] Запуск сбора данных в реальном времени...")
+                worker.submit(MT5Task(
+                    task_type="start_realtime",
+                    result_callback=lambda res: print("[Main] Сбор реальных данных запущен"),
+                    error_callback=lambda e: print(f"[Main] Ошибка запуска сбора: {e}")
+                ))
+            else:
+                print("[Main] Сбор реальных данных отключен в настройках")
+        else:
+            print("[Main] Не удалось подключиться к MT5. Остановка.")
+            worker.stop()
+
+    worker.submit(MT5Task(
+        task_type="connect",
+        result_callback=on_connect_result,
+        error_callback=lambda e: print(f"[Main] Ошибка при подключении: {e}")
+    ))
+
+    # 2) Поток ввода команд пользователя
+    input_thread = threading.Thread(
+        target=_user_input_loop,
+        args=(worker, shutdown_command),
+        daemon=True
+    )
+    input_thread.start()
 
     try:
-        if mt5_conn.connect():
-            print("Успешно подключились к MT5")
-            mt5_conn._start_connection_monitor()  # Запускаем мониторинг подключения
-        else:
-            return
-
-        # Основной цикл с проверкой команды отключения
-        print(f"\nСистема запущена. Для отключения введите: '{shutdown_command}'")
-
-        while True:
-            try:
-                # Выполняем все операции
-                _execute_trading_operations(
-                    mt5_conn,
-                    json_manager,
-                    display_settings,
-                    history_settings,
-                    symbols_directories
-                )
-
-                # Проверяем команду отключения (ввод пользователя)
-                user_input = input("\nВведите команду (или нажмите Enter для продолжения): ").strip()
-                if user_input.lower() == shutdown_command.lower():
-                    print("Получена команда отключения системы...")
-                    break
-
-                # Если пользователь ничего не ввёл, просто продолжаем цикл
-                if not user_input:
-                    continue
-
-                # Здесь можно добавить обработку других команд в будущем
-                if user_input:
-                    print(f"Неизвестная команда: {user_input}. Для отключения используйте: '{shutdown_command}'")
-
-            except KeyboardInterrupt:
-                print("\nПрервано пользователем")
-                break
-    except Exception as e:
-        print(f"Ошибка в операционном цикле: {str(e)}")
-        # Продолжаем работу — мониторинг и переподключение продолжат работать
-
+        # Держим главный поток живым, пока работает воркер
+        while worker._is_running or input_thread.is_alive():
+            time.sleep(1)
+            
+            # Периодически выводим статистику сбора (для отладки)
+            if realtime_enabled and worker.realtime_collector:
+                # Раз в 30 секунд показываем статистику
+                if int(time.time()) % 30 == 0:
+                    stats = worker.realtime_collector.get_stats()
+                    if stats.get('total_records', 0) > 0:
+                        print(f"\n[Main] Статистика сбора: {stats['total_records']} записей, "
+                              f"символы: {', '.join(stats['symbols'])}")
+                        
     except KeyboardInterrupt:
-        print("\nПрервано пользователем")
-    except Exception as e:
-        print(f"Критическая ошибка в основном цикле: {str(e)}")
+        print("\n[Main] Прервано пользователем.")
     finally:
-        mt5_conn.disconnect()  # Гарантированное отключение и остановка мониторинга
-        print("Система корректно завершена.")
+        print("[Main] Завершение работы...")
+        
+        # Останавливаем сбор реального времени
+        if worker.realtime_collector:
+            print("[Main] Остановка сбора реальных данных...")
+            worker.submit(MT5Task(
+                task_type="stop_realtime",
+                result_callback=lambda res: print("[Main] Сбор реальных данных остановлен"),
+                error_callback=lambda e: print(f"[Main] Ошибка остановки сбора: {e}")
+            ))
+            time.sleep(2)  # Даем время на сохранение буфера
+        
+        # Останавливаем воркер
+        worker.stop()
+        print("[Main] Система корректно завершена.")
 
 
-def _execute_trading_operations(mt5_conn, json_manager, display_settings, history_settings, symbols_directories):
-    """Выполняет все торговые операции."""
-    # Информация о терминале
-    terminal_info = None
+def _schedule_initial_operations(
+    worker: WorkerMT5Task,
+    display_settings: dict,
+    history_settings: dict,
+    symbols_directories: Any
+):
+    """Планирует начальные операции после подключения."""
+
+    # Терминал
     if display_settings.get('terminal_info', True):
-        terminal_info = mt5_conn.get_terminal_info()
-    if terminal_info:
-        print("\nИнформация о терминале:")
-        print(f" Версия терминала: {terminal_info['build']}")
-        print(f" Название: {terminal_info['name']}")
+        worker.submit(MT5Task(
+            task_type="get_terminal_info",
+            result_callback=_handle_terminal_info
+        ))
 
-    # Информация о счёте
-    account_info = None
+    # Счёт
     if display_settings.get('account_info', True):
-        account_info = mt5_conn.get_account_info()
-    if account_info:
-        print("\nИнформация о счёте:")
-        print(f" Логин: {account_info['login']}")
-        print(f" Баланс: {account_info['balance']} {account_info['currency']}")
-        print(f" Эквити: {account_info['equity']} {account_info['currency']}")
+        worker.submit(MT5Task(
+            task_type="get_account_info",
+            result_callback=_handle_account_info
+        ))
 
-    # Работа с символами
-    symbols = []
+    # Символы
     if display_settings.get('all_symbols', True):
-        symbols = mt5_conn.symbols_get()
+        worker.submit(MT5Task(
+            task_type="get_symbols",
+            result_callback=lambda res: _handle_symbols(
+                res, display_settings, symbols_directories
+            )
+        ))
 
-    if symbols:
-        json_manager.save_symbols_to_json(symbols)
+    # История (если включена)
+    if history_settings.get('enabled', False):
+        worker.submit(MT5Task(
+            task_type="download_history",
+            payload={"history_settings": history_settings},
+            result_callback=lambda res: print("[Main] Загрузка истории завершена.")
+        ))
 
-    results = None  # Гарантируем существование переменной
 
-    if display_settings.get('grouped_symbols', True) and symbols:
+def _handle_terminal_info(res: dict):
+    info = res.get("terminal_info")
+    if info:
+        print("\nИнформация о терминале:")
+        print(f" Версия терминала: {info['build']}")
+        print(f" Название: {info['name']}")
+
+
+def _handle_account_info(res: dict):
+    acc = res.get("account_info")
+    if acc:
+        print("\nИнформация о счёте:")
+        print(f" Логин: {acc['login']}")
+        print(f" Баланс: {acc['balance']} {acc['currency']}")
+        print(f" Эквити: {acc['equity']} {acc['currency']}")
+
+
+def _handle_symbols(res: dict, display_settings: dict, symbols_directories: Any):
+    symbols = res.get("symbols", [])
+    if not symbols:
+        print("\nСписок символов пуст")
+        return
+
+    json_manager = JsonManager()
+    json_manager.save_symbols_to_json(symbols)
+
+    if display_settings.get('grouped_symbols', True):
         group_and_display_symbols(symbols)
         mt5_symbols = [MT5Symbol(symbol) for symbol in symbols]
         results = MT5Symbol.create_all_directories(mt5_symbols, symbols_directories)
 
         print(f"\nСоздано директорий: {len(results['created'])}")
         print(f"Уже существовали: {len(results['already_existed'])}")
-
         if results['errors']:
             print(f"Ошибки при создании: {len(results['errors'])}")
-    elif not symbols:
-        print("\nСписок символов пуст")
     else:
-        # Если grouped_symbols=False, но символы есть — просто сообщаем, что группировка отключена
-        print("\nГруппировка и создание директорий отключены (display.grouped_symbols = False)")
+        print("\nГруппировка и создание директорий отключены.")
 
-    # Проверка согласованности настроек символов
-    history_symbols = history_settings.get('symbols', [])
-    if symbols_directories != 'all' and isinstance(symbols_directories, list) and set(history_symbols) != set(symbols_directories):
-        print("ПРЕДУПРЕЖДЕНИЕ: Настройки 'symbols' и 'symbols_directories' не согласованы!")
-        print(f" 'symbols': {history_symbols}")
-        print(f" 'symbols_directories': {symbols_directories}")
-        print(" Рекомендуется привести их к одинаковым значениям.")
 
-    # Загрузка исторических данных (если включено в настройках)
-    if history_settings.get('enabled', False):
-        print("\n" + "=" * 60)
-        print("ЗАГРУЗКА ИСТОРИЧЕСКИХ ДАННЫХ")
-        print("=" * 60)
-        HistoryManager.download_and_save_history(mt5_conn, history_settings)
+def _user_input_loop(worker: WorkerMT5Task, shutdown_command: str):
+    """Цикл обработки пользовательского ввода."""
+    while True:
+        try:
+            user_input = input("\nВведите команду: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if user_input.lower() == shutdown_command.lower():
+            print("Получена команда отключения системы...")
+            worker._stop_flag = True
+            break
+        elif user_input == "stats":
+            # Показываем статистику сбора
+            if worker.realtime_collector:
+                stats = worker.realtime_collector.get_stats()
+                print(f"\nСтатистика сбора данных:")
+                print(f"  Всего записей: {stats.get('total_records', 0)}")
+                print(f"  Символы: {stats.get('symbols', [])}")
+                print(f"  Начало: {stats.get('start_time', 'Нет данных')}")
+                print(f"  Конец: {stats.get('end_time', 'Нет данных')}")
+                print(f"  Буфер: {stats.get('buffer_size', 0)} записей")
+            else:
+                print("Сбор данных не запущен")
+        elif user_input == "realtime stop":
+            if worker.realtime_collector:
+                worker.realtime_collector.stop()
+                print("Сбор данных остановлен")
+            else:
+                print("Сбор данных не запущен")
+        elif user_input == "realtime start":
+            worker.submit(MT5Task(
+                task_type="start_realtime",
+                result_callback=lambda res: print("Сбор данных запущен"),
+                error_callback=lambda e: print(f"Ошибка запуска: {e}")
+            ))
+        elif not user_input:
+            continue
+        else:
+            print(f"Неизвестная команда: '{user_input}'. Доступные команды:")
+            print(f"  {shutdown_command} - завершение работы")
+            print("  stats - статистика сбора данных")
+            print("  realtime start - запустить сбор данных")
+            print("  realtime stop - остановить сбор данных")
 
 
 if __name__ == "__main__":
     main()
-0
