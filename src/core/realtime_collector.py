@@ -133,9 +133,6 @@ class RealtimeCollector:
     def _collect_loop(self):
         """Основной цикл сбора данных с синхронизацией по UTC."""
         try:
-            # Ждем начала следующей минуты для синхронизации
-            self._sync_to_next_minute()
-            
             while self._running and not self._stop_requested:
                 try:
                     # Проверяем подключение
@@ -145,14 +142,14 @@ class RealtimeCollector:
                         time.sleep(30)
                         continue
                     
+                    # Ждём до начала следующей минуты + 1 секунда (как в примере)
+                    self._wait_until_next_minute_utc(delay_after_minute_start=1.0)
+                    
                     # Собираем данные за последние минуты с запасом
                     self._collect_recent_data()
                     
                     # Сохраняем буфер при необходимости
                     self._check_and_save_buffer()
-                    
-                    # Ждем до следующей минуты, но проверяем флаг остановки
-                    self._wait_until_next_minute()
                     
                 except Exception as e:
                     print(f"[RealtimeCollector] Ошибка в цикле сбора: {e}")
@@ -165,31 +162,37 @@ class RealtimeCollector:
             # Сохраняем буфер при выходе
             self._flush_buffer()
             print("[RealtimeCollector] Цикл сбора завершен")
-    
-    def _sync_to_next_minute(self):
-        """Синхронизирует начало работы с началом следующей минуты."""
+
+    def _wait_until_next_minute_utc(self, delay_after_minute_start=1.0):
+        """
+        Ждёт ровно до (начало следующей минуты + delay_after_minute_start) по UTC.
+        Как в примере: даёт MT5 1 секунду на формирование бара.
+        """
         now = datetime.utcnow()
-        next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-        wait_seconds = (next_minute - now).total_seconds()
-        if wait_seconds > 0 and wait_seconds < 60:  # Не ждем больше минуты
-            print(f"[RealtimeCollector] Синхронизация: ожидание {wait_seconds:.1f} секунд")
+        # Время начала текущей минуты (XX:XX:00)
+        current_minute_start = now.replace(second=0, microsecond=0)
+        # Время начала следующей минуты (XX:(XX+1):00)
+        next_minute_start = current_minute_start + timedelta(minutes=1)
+        
+        # Целевое время: начало следующей минуты + задержка (1 секунда)
+        target_time = next_minute_start + timedelta(seconds=delay_after_minute_start)
+        
+        wait_seconds = (target_time - now).total_seconds()
+        
+        if wait_seconds > 0:
+            print(f"[RealtimeCollector] Ожидание до {target_time.strftime('%H:%M:%S')} UTC ({wait_seconds:.2f} сек)...")
             # Проверяем флаг остановки во время ожидания
             for _ in range(int(wait_seconds)):
                 if self._stop_requested:
                     return
                 time.sleep(1)
-    
-    def _wait_until_next_minute(self):
-        """Ожидает до начала следующей минуты с проверкой флага остановки."""
-        now = datetime.utcnow()
-        next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-        wait_seconds = (next_minute - now).total_seconds()
-        if wait_seconds > 0 and wait_seconds < 60:
-            # Проверяем флаг остановки во время ожидания
-            for _ in range(int(wait_seconds)):
-                if self._stop_requested:
-                    return
-                time.sleep(1)
+            # Добиваем остаток секунд
+            remaining = wait_seconds - int(wait_seconds)
+            if remaining > 0 and not self._stop_requested:
+                time.sleep(remaining)
+        else:
+            # Если опоздали, ждём 1 секунду
+            time.sleep(1.0)
     
     def _check_connection(self) -> bool:
         """Проверяет подключение к MT5."""

@@ -222,9 +222,8 @@ class MT5Connection: # Упрощённый класс для подключен
                 return None
 
             df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            # Устанавливаем UTC для временных меток
-            df['time'] = df['time'].dt.tz_localize('UTC')
+            # В примере используется utc=True, что эквивалентно
+            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
             return df
 
         except Exception as e:
