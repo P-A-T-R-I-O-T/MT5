@@ -106,6 +106,8 @@ class HistoryManager:
         required_columns = ['time', 'open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume', 'symbol']
         
         if not filename.exists():
+            # Создаём директорию, если её нет
+            filename.parent.mkdir(parents=True, exist_ok=True)
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 f.write(','.join(required_columns) + '\n')
             return True
