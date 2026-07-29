@@ -5,56 +5,189 @@ import threading
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 import MetaTrader5 as mt5
-
 from src.utils.json_manager import JsonManager
 
-
 class RealtimeCollector:
-    """Класс для сбора данных в реальном времени с конвертацией в UTC."""
-    
     def __init__(self, mt5_conn, json_manager: JsonManager):
         self.mt5_conn = mt5_conn
         self.json_manager = json_manager
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._symbols: List[str] = []
+        self._symbol = None
         self._timeframe = mt5.TIMEFRAME_M1
-        self._last_times: Dict[str, datetime] = {}
-        self._lock = threading.Lock()
-        self._buffer: List[pd.DataFrame] = []  # Буфер для накопления данных
-        self._buffer_size = 100  # Записываем в файл каждые 100 свечей
-        self._last_save_time = datetime.utcnow()
-        self._save_interval = timedelta(minutes=5)  # Или каждые 5 минут
-        self._stop_requested = False  # Флаг для быстрой остановки
-        
-        # Кэшируем смещение времени сервера
-        self._server_offset = None
+        self._output_file = Path('F:/MT5-soft/history') / 'real.csv'
+        self._base_dir = Path('F:/MT5-soft/history')
         
         # Настройки
         settings = json_manager.load_settings()
         history_settings = settings.get('history', {})
-        
-        
-        # Используем символы из realtime или из общего списка
-        self._symbols = history_settings.get('symbols', [])
+        self._symbol = history_settings.get('symbols', ['GBPUSD'])[0]
         timeframe_str = history_settings.get('timeframe', 'M1')
         self._timeframe = self._get_timeframe(timeframe_str)
+                
+        # Проверяем и подготавливаем файл
+        self._prepare_initial_data()
+
+    def _prepare_initial_data(self):
+        """Подготовка данных при инициализации"""
+        from src.utils.history_manager import HistoryManager
         
-        # Путь для сохранения
-        self.history_dir = Path('F:/MT5-soft/history')
-        self.real_file = self.history_dir / 'real.parquet'
-        self.history_dir.mkdir(parents=True, exist_ok=True)
+        # Проверяем и подготавливаем real.csv
+        is_valid = HistoryManager.check_or_create_output_file(self._output_file)
         
-        # Загружаем существующие данные
-        self._existing_data = self._load_existing_data()
+        if not is_valid:
+            print("[WARN] Файл real.csv признан битым. Удаляю и создаю заново.")
+            try:
+                self._output_file.unlink()
+            except:
+                pass
+            HistoryManager.check_or_create_output_file(self._output_file)
+
+    def start(self):
+        if self._running:
+            return
         
-        # Инициализируем last_times
-        self._init_last_times()
-    
+        if not self._symbol:
+            return
+        
+        if not self.mt5_conn._is_connected:
+            return
+        
+        self._running = True
+        self._thread = threading.Thread(target=self._collect_loop, daemon=True)
+        self._thread.start()
+        print(f"[RealtimeCollector] Запущен для {self._symbol}")
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+        print("[RealtimeCollector] Остановлен")
+
+    def _collect_loop(self):
+        """Основной цикл сбора данных"""
+        while self._running:
+            utc_now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+            
+            # Проверяем активность торговой сессии
+            if not self._is_trading_active(utc_now):
+                print(f"[{utc_now.strftime('%H:%M:%S')}] Торговая сессия неактивна. Ждём 1 час...")
+                time.sleep(3600)
+                continue
+            
+            # Синхронизируемся на начало следующей минуты + 1 секунда
+            self._wait_until_next_minute_utc(delay_after_minute_start=1.0)
+            
+            # Получаем синхронизированное время
+            utc_now_synced = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+            
+            # Определяем диапазон для догрузки
+            last_time = self._get_last_recorded_time()
+            if last_time is None:
+                last_time = utc_now_synced.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(minutes=1)
+            
+            start_time = last_time + timedelta(minutes=1)
+            end_time = utc_now_synced
+            
+            if start_time > end_time:
+                time.sleep(10)
+                continue
+            
+            # Получаем данные
+            df = self._get_latest_closed_bars(self._symbol, self._timeframe, start_time, end_time)
+            
+            if df is None or df.empty:
+                continue
+            
+            # Сохраняем в CSV
+            self._save_bars_to_csv(df)
+            
+            min_time = df['time'].min().strftime('%H:%M')
+            max_time = df['time'].max().strftime('%H:%M')
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Записаны новые бары: {min_time} - {max_time} ({len(df)} шт.)")
+
+    def _wait_until_next_minute_utc(self, delay_after_minute_start=1.0):
+        """Ждёт до начала следующей минуты + задержка"""
+        now = datetime.now(timezone.utc)
+        current_minute_start = now.replace(second=0, microsecond=0)
+        next_minute_start = current_minute_start + timedelta(minutes=1)
+        target_time = next_minute_start + timedelta(seconds=delay_after_minute_start)
+        
+        wait_seconds = (target_time - now).total_seconds()
+        
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _get_latest_closed_bars(self, symbol, timeframe, start_time, end_time):
+        """Получает закрытые бары"""
+        rates = mt5.copy_rates_range(
+            symbol,
+            timeframe,
+            start_time.replace(second=0, microsecond=0),
+            end_time.replace(second=0, microsecond=0)
+        )
+        
+        if rates is None:
+            return None
+        
+        df = pd.DataFrame(rates)
+        if df.empty:
+            return None
+        
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+        cols_order = ['time', 'open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume']
+        df = df[cols_order]
+        df['symbol'] = symbol
+        
+        return df
+
+    def _save_bars_to_csv(self, df: pd.DataFrame) -> bool:
+        """Сохраняет бары в CSV с форматом DD-MM-YYYY"""
+        if df.empty:
+            return False
+        
+        # Конвертируем время в формат DD-MM-YYYY HH:MM:SS
+        df_display = df.copy()
+        df_display['time'] = df_display['time'].dt.strftime('%d-%m-%Y %H:%M:%S')
+        
+        file_exists = self._output_file.exists()
+        df_display.to_csv(
+            self._output_file,
+            mode='a',
+            index=False,
+            header=not file_exists
+        )
+        return True
+
+    def _get_last_recorded_time(self):
+        """Возвращает время последней записи из real.csv"""
+        if not self._output_file.exists():
+            return None
+        
+        try:
+            df = pd.read_csv(self._output_file)
+            if df.empty:
+                return None
+            
+            if 'time' not in df.columns:
+                return None
+            
+            # Парсим время в формате DD-MM-YYYY HH:MM:SS
+            df['time'] = pd.to_datetime(df['time'], format='%d-%m-%Y %H:%M:%S', utc=True)
+            last_time = df['time'].iloc[-1]
+            return last_time.replace(second=0, microsecond=0)
+        except Exception:
+            return None
+
+    def _is_trading_active(self, utc_now: datetime) -> bool:
+        """Проверяет активность торговой сессии"""
+        weekday = utc_now.weekday()
+        return weekday < 5  # Пн-Пт
+
     def _get_timeframe(self, timeframe_str: str) -> int:
-        """Преобразует строку таймфрейма в константу MT5."""
+        """Преобразует строку таймфрейма в константу MT5"""
         mapping = {
             'M1': mt5.TIMEFRAME_M1,
             'M5': mt5.TIMEFRAME_M5,
@@ -63,401 +196,11 @@ class RealtimeCollector:
             'D1': mt5.TIMEFRAME_D1
         }
         return mapping.get(timeframe_str, mt5.TIMEFRAME_M1)
-    
-    def _load_existing_data(self) -> pd.DataFrame:
-        """Загружает существующие данные из real.parquet."""
-        if self.real_file.exists():
-            try:
-                df = pd.read_parquet(self.real_file)
-                if 'time' in df.columns:
-                    # Приводим время к UTC
-                    if not pd.api.types.is_datetime64_any_dtype(df['time']):
-                        df['time'] = pd.to_datetime(df['time'], utc=True)
-                    else:
-                        if df['time'].dt.tz is None:
-                            df['time'] = df['time'].dt.tz_localize('UTC')
-                        else:
-                            df['time'] = df['time'].dt.tz_convert('UTC')
-                return df
-            except Exception as e:
-                print(f"[RealtimeCollector] Ошибка загрузки real.parquet: {e}")
-                return pd.DataFrame()
-        return pd.DataFrame()
-    
-    def _init_last_times(self):
-        """Инициализирует последние времена для каждого символа."""
-        if self._existing_data.empty:
-            return
-        
-        for symbol in self._symbols:
-            symbol_data = self._existing_data[self._existing_data['symbol'] == symbol]
-            if not symbol_data.empty:
-                self._last_times[symbol] = symbol_data['time'].max()
-    
-    def start(self):
-        """Запускает сбор данных в реальном времени."""
-        if self._running:
-            print("[RealtimeCollector] Уже запущен")
-            return
-        
-        if not self._symbols:
-            print("[RealtimeCollector] Нет символов для отслеживания")
-            return
-        
-        if not self.mt5_conn._is_connected:
-            print("[RealtimeCollector] MT5 не подключен")
-            return
-        
-        self._running = True
-        self._stop_requested = False
-        self._thread = threading.Thread(target=self._collect_loop, daemon=True)
-        self._thread.start()
-        print(f"[RealtimeCollector] Запущен для {len(self._symbols)} символов")
-    
-    def stop(self):
-        """Останавливает сбор данных и сохраняет буфер."""
-        print("[RealtimeCollector] Запрос остановки...")
-        self._stop_requested = True
-        self._running = False
-        
-        if self._thread:
-            # Ждем завершения потока с таймаутом
-            self._thread.join(timeout=10)
-            if self._thread.is_alive():
-                print("[RealtimeCollector] Поток не завершился, принудительная остановка...")
-        
-        # Сохраняем остатки буфера
-        self._flush_buffer()
-        print("[RealtimeCollector] Остановлен")
-    
-    def _collect_loop(self):
-        """Основной цикл сбора данных с синхронизацией по UTC."""
-        try:
-            while self._running and not self._stop_requested:
-                try:
-                    # Проверяем подключение
-                    if not self._check_connection():
-                        if self._stop_requested:
-                            break
-                        time.sleep(30)
-                        continue
-                    
-                    # Ждём до начала следующей минуты + 1 секунда (как в примере)
-                    self._wait_until_next_minute_utc(delay_after_minute_start=1.0)
-                    
-                    # Собираем данные за последние минуты с запасом
-                    self._collect_recent_data()
-                    
-                    # Сохраняем буфер при необходимости
-                    self._check_and_save_buffer()
-                    
-                except Exception as e:
-                    print(f"[RealtimeCollector] Ошибка в цикле сбора: {e}")
-                    if self._stop_requested:
-                        break
-                    time.sleep(10)
-        except Exception as e:
-            print(f"[RealtimeCollector] Критическая ошибка в цикле: {e}")
-        finally:
-            # Сохраняем буфер при выходе
-            self._flush_buffer()
-            print("[RealtimeCollector] Цикл сбора завершен")
 
-    def _wait_until_next_minute_utc(self, delay_after_minute_start=1.0):
-        """
-        Ждёт ровно до (начало следующей минуты + delay_after_minute_start) по UTC.
-        Как в примере: даёт MT5 1 секунду на формирование бара.
-        """
-        now = datetime.utcnow()
-        # Время начала текущей минуты (XX:XX:00)
-        current_minute_start = now.replace(second=0, microsecond=0)
-        # Время начала следующей минуты (XX:(XX+1):00)
-        next_minute_start = current_minute_start + timedelta(minutes=1)
-        
-        # Целевое время: начало следующей минуты + задержка (1 секунда)
-        target_time = next_minute_start + timedelta(seconds=delay_after_minute_start)
-        
-        wait_seconds = (target_time - now).total_seconds()
-        
-        if wait_seconds > 0:
-            print(f"[RealtimeCollector] Ожидание до {target_time.strftime('%H:%M:%S')} UTC ({wait_seconds:.2f} сек)...")
-            # Проверяем флаг остановки во время ожидания
-            for _ in range(int(wait_seconds)):
-                if self._stop_requested:
-                    return
-                time.sleep(1)
-            # Добиваем остаток секунд
-            remaining = wait_seconds - int(wait_seconds)
-            if remaining > 0 and not self._stop_requested:
-                time.sleep(remaining)
-        else:
-            # Если опоздали, ждём 1 секунду
-            time.sleep(1.0)
-    
-    def _check_connection(self) -> bool:
-        """Проверяет подключение к MT5."""
-        if not self.mt5_conn._is_connected:
-            print("[RealtimeCollector] MT5 отключен, ожидание переподключения...")
-            return False
-        
-        try:
-            # Проверяем через терминал
-            info = mt5.terminal_info()
-            if info is None:
-                print("[RealtimeCollector] MT5 недоступен")
-                return False
-            return True
-        except:
-            return False
-    
-    def _get_server_timezone_offset(self) -> int:
-        """
-        Определяет смещение времени сервера MT5 относительно UTC.
-        Возвращает количество часов (например, 2 или 3).
-        Результат кэшируется для ускорения.
-        """
-        if self._server_offset is not None:
-            return self._server_offset
-        
-        try:
-            # Пробуем получить время сервера через тик
-            tick = mt5.symbol_info_tick("EURUSD")
-            if tick and tick.time:
-                server_time = datetime.fromtimestamp(tick.time)
-                utc_time = datetime.utcnow()
-                
-                # Вычисляем разницу в часах
-                diff = (server_time - utc_time).total_seconds() / 3600
-                offset = round(diff)
-                
-                # Для форекс брокеров обычно 2 или 3
-                if offset in [2, 3]:
-                    print(f"[RealtimeCollector] Определено смещение сервера: GMT+{offset}")
-                    self._server_offset = offset
-                    return offset
-                else:
-                    print(f"[RealtimeCollector] Обнаружено нестандартное смещение: GMT+{offset}, используем 3")
-                    self._server_offset = 3
-                    return 3
-        except Exception as e:
-            print(f"[RealtimeCollector] Ошибка определения смещения: {e}")
-        
-        # По умолчанию для большинства форекс брокеров - GMT+3 (лето) или GMT+2 (зима)
-        # Определяем по текущей дате
-        now = datetime.utcnow()
-        # В Европе летнее время с последнего воскресенья марта по последнее воскресенье октября
-        is_summer = self._is_european_summer_time(now)
-        offset = 3 if is_summer else 2
-        print(f"[RealtimeCollector] Используем смещение по умолчанию: GMT+{offset} (летнее время: {is_summer})")
-        self._server_offset = offset
-        return offset
-    
-    def _is_european_summer_time(self, dt: datetime) -> bool:
-        """Проверяет, является ли дата европейским летним временем."""
-        year = dt.year
-        # Последнее воскресенье марта
-        last_sunday_march = self._get_last_sunday(year, 3)
-        # Последнее воскресенье октября
-        last_sunday_october = self._get_last_sunday(year, 10)
-        
-        return last_sunday_march <= dt <= last_sunday_october
-    
-    def _get_last_sunday(self, year: int, month: int) -> datetime:
-        """Возвращает дату последнего воскресенья в указанном месяце."""
-        from datetime import date
-        # Последний день месяца
-        if month == 12:
-            last_day = date(year, month, 31)
-        else:
-            last_day = date(year, month + 1, 1) - timedelta(days=1)
-        
-        # Ищем воскресенье
-        while last_day.weekday() != 6:  # 6 - воскресенье
-            last_day -= timedelta(days=1)
-        
-        return datetime(last_day.year, last_day.month, last_day.day)
-    
-    def _collect_recent_data(self):
-        """Собирает свечи за последние несколько минут и конвертирует в UTC."""
-        now = datetime.utcnow()
-        
-        # Получаем последние 10 свечей для каждого символа с запасом
-        count = 10  # Запрашиваем 10 свечей
-        
-        all_new_data = []
-        
-        # Получаем смещение сервера один раз
-        server_offset = self._get_server_timezone_offset()
-        
-        for symbol in self._symbols:
-            # Проверяем флаг остановки
-            if self._stop_requested:
-                break
-                
-            try:
-                # Получаем последние N свечей
-                rates = mt5.copy_rates_from_pos(
-                    symbol,
-                    self._timeframe,
-                    0,  # Начинаем с последней свечи
-                    count
-                )
-                
-                if rates is None or len(rates) == 0:
-                    continue
-                
-                # Конвертируем в DataFrame
-                df = pd.DataFrame(rates)
-                
-                # КЛЮЧЕВОЙ МОМЕНТ: Конвертируем время в UTC
-                # MT5 возвращает время в секундах с 1970-01-01 в локальном времени сервера
-                # Мы переводим это в UTC, используя смещение сервера
-                df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
-                
-                # Корректируем время: вычитаем смещение, чтобы получить UTC
-                # Если сервер в GMT+3, то вычитаем 3 часа
-                df['time'] = df['time'] - pd.Timedelta(hours=server_offset)
-                
-                df['symbol'] = symbol
-                
-                # Фильтруем только новые данные
-                last_time = self._last_times.get(symbol)
-                if last_time:
-                    # Для сравнения используем UTC время
-                    df = df[df['time'] > last_time]
-                
-                if not df.empty:
-                    all_new_data.append(df)
-                    self._last_times[symbol] = df['time'].max()
-                    # Выводим пример времени для отладки
-                    sample_time = df['time'].iloc[0]
-                    print(f"[RealtimeCollector] {symbol}: получено {len(df)} новых свечей, "
-                          f"последняя в {sample_time.strftime('%H:%M:%S')} UTC")
-                    
-            except Exception as e:
-                print(f"[RealtimeCollector] Ошибка для {symbol}: {e}")
-        
-        # Добавляем в буфер
-        if all_new_data and not self._stop_requested:
-            with self._lock:
-                self._buffer.extend(all_new_data)
-    
-    def _check_and_save_buffer(self):
-        """Проверяет буфер и сохраняет при необходимости."""
-        if self._stop_requested:
-            return
-            
-        should_save = False
-        
-        with self._lock:
-            buffer_count = sum(len(df) for df in self._buffer)
-            if buffer_count >= self._buffer_size:
-                should_save = True
-            elif (datetime.utcnow() - self._last_save_time) >= self._save_interval:
-                if buffer_count > 0:
-                    should_save = True
-        
-        if should_save:
-            self._flush_buffer()
-    
-    def _flush_buffer(self):
-        """Сохраняет буфер в файл."""
-        with self._lock:
-            if not self._buffer:
-                return
-            
-            try:
-                # Объединяем все данные из буфера
-                new_df = pd.concat(self._buffer, ignore_index=True)
-                self._buffer = []
-                self._last_save_time = datetime.utcnow()
-                
-                # Сохраняем в файл
-                self._save_data(new_df)
-                
-            except Exception as e:
-                print(f"[RealtimeCollector] Ошибка сохранения буфера: {e}")
-    
-    def _save_data(self, new_df: pd.DataFrame):
-        """Сохраняет новые данные в real.parquet."""
-        if new_df.empty:
-            return
-        
-        try:
-            # Загружаем существующие данные
-            if self.real_file.exists():
-                existing_df = pd.read_parquet(self.real_file)
-                # Приводим время к UTC
-                if 'time' in existing_df.columns and not pd.api.types.is_datetime64_any_dtype(existing_df['time']):
-                    existing_df['time'] = pd.to_datetime(existing_df['time'], utc=True)
-                
-                # Объединяем
-                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-            else:
-                combined_df = new_df
-            
-            # Удаляем дубликаты по time + symbol
-            combined_df.drop_duplicates(subset=['time', 'symbol'], keep='last', inplace=True)
-            
-            # Сортируем по времени
-            combined_df.sort_values('time', inplace=True)
-            
-            # Сохраняем
-            combined_df.to_parquet(self.real_file, engine='pyarrow', index=False)
-            
-            # Обновляем кэш
-            self._existing_data = combined_df
-            
-            print(f"[RealtimeCollector] Сохранено {len(new_df)} записей в real.parquet")
-            
-        except Exception as e:
-            print(f"[RealtimeCollector] Ошибка сохранения: {e}")
-    
-    def get_data(self, symbol: str = None, start_time: datetime = None, 
-                 end_time: datetime = None) -> pd.DataFrame:
-        """Возвращает данные с фильтрацией."""
-        with self._lock:
-            if self._existing_data.empty:
-                return pd.DataFrame()
-            
-            df = self._existing_data.copy()
-            
-            if symbol:
-                df = df[df['symbol'] == symbol]
-            
-            if start_time:
-                df = df[df['time'] >= start_time]
-            
-            if end_time:
-                df = df[df['time'] <= end_time]
-            
-            return df.sort_values('time')
-    
-    def get_latest_candle(self, symbol: str) -> Optional[pd.Series]:
-        """Возвращает последнюю свечу для символа."""
-        df = self.get_data(symbol=symbol)
-        if df.empty:
-            return None
-        return df.iloc[-1]
-    
     def get_stats(self) -> dict:
-        """Возвращает статистику по собранным данным."""
-        with self._lock:
-            if self._existing_data.empty:
-                return {
-                    'total_records': 0,
-                    'symbols': [],
-                    'buffer_size': sum(len(df) for df in self._buffer),
-                    'is_running': self._running
-                }
-            
-            return {
-                'total_records': len(self._existing_data),
-                'symbols': self._existing_data['symbol'].unique().tolist(),
-                'start_time': self._existing_data['time'].min(),
-                'end_time': self._existing_data['time'].max(),
-                'buffer_size': sum(len(df) for df in self._buffer),
-                'records_by_symbol': self._existing_data['symbol'].value_counts().to_dict(),
-                'is_running': self._running,
-                'server_offset': self._server_offset
-            }
+        """Возвращает статистику"""
+        return {
+            'symbol': self._symbol,
+            'is_running': self._running,
+            'output_file': str(self._output_file)
+        }

@@ -14,7 +14,6 @@
   "history": {
     "enabled": true,
     "start_date": "2026-04-02",
-    "end_date": "2026-04-05",
     "timeframe": "M1",
     "symbols": ["GBPUSD", "EURUSD"],
     "mode": "custom",

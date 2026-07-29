@@ -144,11 +144,13 @@ class WorkerMT5Task:
             if task.result_callback:
                 task.result_callback({"symbols": symbols})
 
-        elif t_type == "download_history":
+        elif t_type == "initialize_history":
+            # Инициализация истории с архивацией
+            from src.utils.history_manager import HistoryManager
             history_settings = task.payload.get("history_settings", {})
-            HistoryManager.download_and_save_history(self.mt5_conn, history_settings)
+            HistoryManager.get_history_with_archiving(self.mt5_conn, history_settings)
             if task.result_callback:
-                task.result_callback({"status": "history_downloaded"})
+                task.result_callback({"status": "history_initialized"})
 
         elif t_type == "start_realtime":
             # Проверяем настройки перед запуском

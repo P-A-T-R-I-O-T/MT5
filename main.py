@@ -141,9 +141,9 @@ def _schedule_initial_operations(
     # История (если включена)
     if history_settings.get('enabled', False):
         worker.submit(MT5Task(
-            task_type="download_history",
+            task_type="initialize_history",  # Изменён тип задачи
             payload={"history_settings": history_settings},
-            result_callback=lambda res: print("[Main] Загрузка истории завершена.")
+            result_callback=lambda res: print("[Main] Инициализация истории завершена.")
         ))
 
 
