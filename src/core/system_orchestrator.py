@@ -4,12 +4,12 @@ import threading
 import time
 import pathlib
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional
 import pandas as pd
 
-from src.core.worker_mt5_task import WorkerMT5Task, MT5Task
-from src.core.file_worker import FileWorker, FileTask
-from src.utils.json_manager import JsonManager
+from src.core.mt5_connection import MT5Connection
+from src.core.workers.worker_mt5 import WorkerMT5, MT5Task
+from src.core.workers.file_worker import FileWorker, FileTask
 from src.utils.history_manager import HistoryManager
 from src.utils.symbol_utils import group_and_display_symbols
 
@@ -23,40 +23,79 @@ class SystemOrchestrator:
     def __init__(self):
         print("1 [SystemOrchestrator.__init__] Инициализация SystemOrchestrator...")
 
-        self.file_worker = FileWorker()
-        print("2 [SystemOrchestrator.__init__] FileWorker создан")
+        print("2 [SystemOrchestrator.__init__] создание FileWorker")
+        self.file_worker = FileWorker() 
+        print("2.1 [SystemOrchestrator.__init__] FileWorker создан")
 
         # 2. Запускаем поток FileWorker
         print("3 [SystemOrchestrator.__init__] Запуск FileWorker...")
         self.file_worker.start()
-        print("4 [SystemOrchestrator.__init__] FileWorker запущен")
+        print("3.1 [SystemOrchestrator.__init__] FileWorker запущен")
 
         # 3. Ждем готовности JsonManager
-        print("5 [SystemOrchestrator.__init__] Ожидание готовности JsonManager...")
+        print("4 [SystemOrchestrator.__init__] Ожидание готовности JsonManager...")
         if not self.file_worker.wait_for_json_manager():
             print("[SystemOrchestrator.__init__] Ошибка: JsonManager не готов")
             raise RuntimeError("JsonManager не инициализирован")
-        print("6 [SystemOrchestrator.__init__] JsonManager готов")
+        print("5 [SystemOrchestrator.__init__] JsonManager готов")
         
         # 4. Загружаем настройки ЧЕРЕЗ FileWorker (асинхронно)
-        print("7 [SystemOrchestrator.__init__] Загрузка настроек через FileWorker...")
-        self.settings = self._load_settings_via_file_worker()
-        print(f"8 [SystemOrchestrator.__init__] Настройки загружены: {self.settings}")
+        print("6 [SystemOrchestrator.__init__] Загрузка настроек через FileWorker...")
+        self.settings = self._load_data_via_file_worker(
+            task_type='load_settings',
+            result_key='settings'
+        )
+        print(f"6.1 [SystemOrchestrator.__init__] Настройки загружены: {self.settings}")
+
+        # Загружаем credentials через FileWorker
+        print("7 [SystemOrchestrator.__init__] Загрузка credentials через FileWorker...")
+        self.credentials = self._load_data_via_file_worker(
+            task_type='load_credentials',
+            result_key='credentials'
+        )
+        print(f"7.1 [SystemOrchestrator.__init__] Настройки загружены: {self.credentials}")
+
 
         # Пути
         self.base_dir = pathlib.Path('F:/MT5-soft/history')
         self.output_file = self.base_dir / 'real.csv'
-        print(f"[SystemOrchestrator.__init__] Базовая директория: {self.base_dir}")
-        print(f"[SystemOrchestrator.__init__] Выходной файл: {self.output_file}")
+        print(f"8 [SystemOrchestrator.__init__] Базовая директория: {self.base_dir}")
+        print(f"9 [SystemOrchestrator.__init__] Выходной файл: {self.output_file}")
+        print("\n" *5)
+
+        # Получаем данные из кеша FileWorker Прямой доступ к json_manager (безопасно, т.к. FileWorker готов)
+        print("[SystemOrchestrator.__init__] Получение данных из кеша...")
+        json_manager = self.file_worker.json_manager
         
+        # Загружаем credentials из кеша
+        credentials = json_manager.load_credentials()
+        print(f"[SystemOrchestrator.__init__] Credentials загружены")
+        
+        # Получаем системные настройки из уже загруженных данных
+        system_settings = self.settings.get('system', {})
+        monitor_interval = system_settings.get('connection_monitor_interval', 30)
+        reconnection_delays = system_settings.get('reconnection_delays', [0, 10, 30, 60, 300])
+        
+        print(f"[SystemOrchestrator.__init__] Monitor interval: {monitor_interval}")
+        print(f"[SystemOrchestrator.__init__] Reconnection delays: {reconnection_delays}")
+        
+        # Создаем MT5Connection
+        print("[SystemOrchestrator.__init__] Создание MT5Connection...")
+        mt5_connection = MT5Connection(
+            credentials=credentials,
+            monitor_interval=monitor_interval,
+            reconnection_delays=reconnection_delays
+        )
+        print("[SystemOrchestrator.__init__] MT5Connection создан")
+        print("\n" *5)
+
+
+
         # Воркеры
-        print("[SystemOrchestrator.__init__] Создание MT5Worker...")
-        # self.mt5_worker = WorkerMT5Task(json_manager)
-        print("[SystemOrchestrator.__init__] MT5Worker создан")
-        
-        print("[SystemOrchestrator.__init__] Создание FileWorker...")
-        # self.file_worker = FileWorker(json_manager)
-        print("[SystemOrchestrator.__init__] FileWorker создан")
+        print("[SystemOrchestrator.__init__] Создание WorkerMT5...")
+        self.r_mt5 = WorkerMT5()
+        print("[SystemOrchestrator.__init__] WorkerMT5 создан")
+
         
         # Состояние
         self.system_running = True
@@ -78,9 +117,9 @@ class SystemOrchestrator:
         print("[SystemOrchestrator.start] FileWorker запущен")
         
         # Запускаем воркеры
-        print("[SystemOrchestrator.start] Запуск MT5Worker...")
+        print("[SystemOrchestrator.start] Запуск WorkerMT5...")
         self.mt5_worker.start()
-        print("[SystemOrchestrator.start] MT5Worker запущен")
+        print("[SystemOrchestrator.start] WorkerMT5 запущен")
         
         # Запускаем основной цикл в отдельном потоке
         print("[SystemOrchestrator.start] Запуск основного цикла в отдельном потоке...")
@@ -114,9 +153,9 @@ class SystemOrchestrator:
                 print("[SystemOrchestrator.stop] Цикл сбора завершен")
         
         # Останавливаем воркеры
-        print("[SystemOrchestrator.stop] Остановка MT5Worker...")
+        print("[SystemOrchestrator.stop] Остановка WorkerMT5...")
         self.mt5_worker.stop()
-        print("[SystemOrchestrator.stop] MT5Worker остановлен")
+        print("[SystemOrchestrator.stop] WorkerMT5 остановлен")
         
         print("[SystemOrchestrator.stop] Остановка FileWorker...")
         self.file_worker.stop()
@@ -675,9 +714,15 @@ class SystemOrchestrator:
         
         return all_ok
 
-    def _load_settings_via_file_worker(self):
-        """Загружает настройки через FileWorker."""
-        print("[SystemOrchestrator._load_settings_via_file_worker] Загрузка настроек...")
+    def _load_data_via_file_worker(self, task_type: str, result_key: str):
+        """
+        Универсальный метод загрузки данных через FileWorker.
+        
+        :param task_type: тип задачи ('load_settings', 'load_credentials')
+        :param result_key: ключ для извлечения результата ('settings', 'credentials')
+        :return: загруженные данные
+        """
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Загрузка {result_key}...")
         
         result = {}
         event = threading.Event()
@@ -688,14 +733,14 @@ class SystemOrchestrator:
         
         # Отправляем задачу в FileWorker
         self.file_worker.submit(FileTask(
-            task_type="load_settings",
+            task_type=task_type,
             result_callback=on_result,
-            error_callback=lambda e: self._handle_error("загрузки настроек", e, event)
+            error_callback=lambda e: self._handle_error(f"загрузки {result_key}", e, event)
         ))
         
         # Ждем результат
         if not event.wait(timeout=10):
-            print("[SystemOrchestrator._load_settings_via_file_worker] Таймаут")
+            print(f"[SystemOrchestrator._load_data_via_file_worker] Таймаут при загрузке {result_key}")
             return {}
         
-        return result.get('settings', {})
+        return result.get(result_key, {})

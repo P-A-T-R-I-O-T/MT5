@@ -8,13 +8,18 @@ import time
 
 class MT5Connection: # Упрощённый класс для подключения к MetaTrader 5
 
-    def __init__(self, json_manager: JsonManager): # Получаем абсолютный путь к файлу
+    def __init__(self, credentials: dict, monitor_interval: int = 30, 
+                 reconnection_delays: list = None): # Получаем абсолютный путь к файлу
         print("[MT5Connection.__init__] Инициализация MT5Connection...")
-        self.json_manager = json_manager
+
+        self.credentials = credentials
+        self.monitor_interval = monitor_interval
+        self.reconnection_delays = reconnection_delays or [0, 10, 30, 60, 300]
+
         self._is_connected = False
         self._monitor_thread = None
         self._monitoring_active = False
-        print("[MT5Connection.__init__] Вызов _load_credentials()...")
+        print("[MT5Connection.__init__] Вызов _load_credentials() / Загрузка учетных данных")
         self._load_credentials()
         print("[MT5Connection.__init__] Инициализация завершена")
 

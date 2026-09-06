@@ -129,7 +129,6 @@ class JsonManager:
         
         self._settings_cache = self._load_json_file(settings_path)
         print(f"[JsonManager.load_settings] Настройки загружены в кеш: {self._settings_cache}")
-        print("\n" *5)
         return self._settings_cache
 
     def get_display_settings(self) -> Dict[str, bool]:

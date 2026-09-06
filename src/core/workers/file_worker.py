@@ -73,7 +73,7 @@ class FileWorker:
 
         # Устанавливаем событие готовности
         self._json_manager_ready.set()
-        print("[4 FileWorker._run_loop] JsonManager готов к работе")
+        print("4 [FileWorker._run_loop] JsonManager готов к работе")
 
         processed_tasks = 0
         
@@ -116,14 +116,21 @@ class FileWorker:
             if task.result_callback:
                 task.result_callback({"settings": settings})
 
-        if t_type == "check_integrity":
+        elif t_type == "load_credentials":  # ДОБАВИТЬ ЭТОТ БЛОК
+            print("[FileWorker._execute_task] Загрузка учетных данных...")
+            credentials = self.json_manager.load_credentials()
+            
+            if task.result_callback:
+                task.result_callback({"credentials": credentials})
+        
+        elif t_type == "check_integrity":
             print("[FileWorker._execute_task] Проверка целостности файлов...")
             results = self.json_manager.check_all_files_integrity()
             
             if task.result_callback:
                 task.result_callback(results)
         
-        if t_type == "check_settings":
+        elif t_type == "check_settings":
             print("[FileWorker._execute_task] Проверка настроек...")
             settings = task.payload.get('settings', {})
             print(f"[FileWorker._execute_task] Получены настройки: {settings}")
