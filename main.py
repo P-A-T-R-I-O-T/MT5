@@ -12,21 +12,17 @@ def main():
     orchestrator = SystemOrchestrator()
     print("3 [main] SystemOrchestrator создан")
 
-    print("4 [main] Запускаем SystemOrchestrator.start()")
-    orchestrator.start()
-    
     try:
-        print("[main] Запуск оркестратора...")
-        orchestrator.start()
+        print("4 [main] Запускаем SystemOrchestrator.start()")
+        orchestrator.start()  # Только один вызов!
         print("[main] Оркестратор запущен")
         
         # Ждем завершения работы
-        print("[main] Ожидание завершения работы системы...")
         while orchestrator.system_running:
             time.sleep(1)
             
     except KeyboardInterrupt:
-        print("\n[main] Прервано пользователем (KeyboardInterrupt).")
+        print("\n[main] Прервано пользователем.")
     except Exception as e:
         print(f"[main] Неожиданная ошибка: {e}")
     finally:

@@ -3,15 +3,16 @@ import threading
 import queue
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
-from pathlib import Path
-from src.utils.history_manager import HistoryManager
 from src.utils.json_manager import JsonManager
+from src.utils.history_manager import HistoryManager
+import pathlib
+from datetime import datetime
 
 @dataclass
 class FileTask:
     """Тип задачи для файлового воркера."""
-    task_type: str  # 'check_settings', 'check_history_dir', 'save_avro', 
-                   # 'prepare_real_csv', 'save_to_real_csv', 'save_daily_avro'
+    task_type: str  # 'load_settings', 'load_credentials', 'prepare_real_csv',
+                # 'save_to_real_csv', 'save_avro', 'save_symbols'
     payload: Optional[Dict[str, Any]] = field(default_factory=dict)
     result_callback: Optional[callable] = None
     error_callback: Optional[callable] = None
@@ -29,6 +30,11 @@ class FileWorker:
         self._stop_flag = False
         self._thread: Optional[threading.Thread] = None
         self._is_running = False
+
+        self.base_dir = pathlib.Path('F:/MT5-soft/history')
+
+        # Последнее записанное время в real.csv — для защиты от дублей
+        self._last_written_time: Dict[str, datetime] = {}
 
         print("2 [FileWorker.__init__] Инициализация завершена")
         
@@ -116,64 +122,12 @@ class FileWorker:
             if task.result_callback:
                 task.result_callback({"settings": settings})
 
-        elif t_type == "load_credentials":  # ДОБАВИТЬ ЭТОТ БЛОК
+        elif t_type == "load_credentials":  
             print("[FileWorker._execute_task] Загрузка учетных данных...")
             credentials = self.json_manager.load_credentials()
             
             if task.result_callback:
                 task.result_callback({"credentials": credentials})
-        
-        elif t_type == "check_integrity":
-            print("[FileWorker._execute_task] Проверка целостности файлов...")
-            results = self.json_manager.check_all_files_integrity()
-            
-            if task.result_callback:
-                task.result_callback(results)
-        
-        elif t_type == "check_settings":
-            print("[FileWorker._execute_task] Проверка настроек...")
-            settings = task.payload.get('settings', {})
-            print(f"[FileWorker._execute_task] Получены настройки: {settings}")
-            
-            valid, errors = HistoryManager.validate_settings(settings)
-            print(f"[FileWorker._execute_task] Результат валидации: valid={valid}, errors={errors}")
-            
-            if task.result_callback:
-                print("[FileWorker._execute_task] Вызов result_callback для check_settings")
-                task.result_callback({
-                    "valid": valid,
-                    "errors": errors
-                })
-                print("[FileWorker._execute_task] result_callback выполнен")
-        
-        elif t_type == "check_history_dir":
-            print("[FileWorker._execute_task] Проверка директории history...")
-            base_dir = task.payload.get('base_dir', self.base_dir)
-            print(f"[FileWorker._execute_task] Проверяемая директория: {base_dir}")
-            
-            created = HistoryManager.check_and_create_history_dir(base_dir)
-            print(f"[FileWorker._execute_task] Результат проверки: created={created}")
-            
-            if task.result_callback:
-                print("[FileWorker._execute_task] Вызов result_callback для check_history_dir")
-                task.result_callback({"created": created, "path": str(base_dir)})
-                print("[FileWorker._execute_task] result_callback выполнен")
-        
-        elif t_type == "prepare_real_csv":
-            print("[FileWorker._execute_task] Подготовка real.csv...")
-            filename = task.payload.get('filename')
-            print(f"[FileWorker._execute_task] Файл для подготовки: {filename}")
-            
-            if filename:
-                print("[FileWorker._execute_task] Вызов HistoryManager.save_real_csv_header")
-                HistoryManager.save_real_csv_header(filename)
-                
-                if task.result_callback:
-                    print("[FileWorker._execute_task] Вызов result_callback для prepare_real_csv")
-                    task.result_callback({"status": "prepared", "filename": str(filename)})
-                    print("[FileWorker._execute_task] result_callback выполнен")
-            else:
-                print("[FileWorker._execute_task] Ошибка: filename не указан")
         
         elif t_type == "save_to_real_csv":
             print("[FileWorker._execute_task] Сохранение данных в real.csv...")
@@ -181,19 +135,46 @@ class FileWorker:
             filename = task.payload.get('filename')
             print(f"[FileWorker._execute_task] Файл: {filename}")
             print(f"[FileWorker._execute_task] Данные: {data.shape if data is not None else 'None'}")
-            
-            if data is not None and filename:
-                print("[FileWorker._execute_task] Вызов HistoryManager.append_to_real_csv")
-                success = HistoryManager.append_to_real_csv(data, filename)
-                print(f"[FileWorker._execute_task] Результат сохранения: {success}")
-                
-                if task.result_callback:
-                    print("[FileWorker._execute_task] Вызов result_callback для save_to_real_csv")
-                    task.result_callback({"status": "saved" if success else "error"})
-                    print("[FileWorker._execute_task] result_callback выполнен")
-            else:
+
+            if data is None or filename is None:
                 print("[FileWorker._execute_task] Ошибка: data или filename не указаны")
-        
+                return
+
+            # --- Фильтр дублей (по каждому символу отдельно) ---
+            if data.empty:
+                print("[FileWorker._execute_task] Пустой DataFrame, пропуск")
+                return
+
+            # В одной задаче все бары — по одному символу
+            symbol = data['symbol'].iloc[0]
+            last_time = self._last_written_time.get(symbol)
+
+            if last_time is not None:
+                before = len(data)
+                data = data[data['time'] > last_time]
+                print(f"[FileWorker._execute_task] Фильтр дублей [{symbol}]: {before} -> {len(data)} записей")
+
+            if data.empty:
+                print(f"[FileWorker._execute_task] Все бары [{symbol}] уже записаны, пропуск")
+                if task.result_callback:
+                    task.result_callback({"status": "skipped"})
+                return
+
+            # --- Запись ---
+            print("[FileWorker._execute_task] Вызов HistoryManager.append_to_real_csv")
+            success = HistoryManager.append_to_real_csv(data, filename)
+            print(f"[FileWorker._execute_task] Результат сохранения: {success}")
+
+            if success:
+                # Обновляем _last_written_time для этого символа
+                self._last_written_time[symbol] = data['time'].max()
+                print(f"[FileWorker._execute_task] _last_written_time[{symbol}] = {self._last_written_time[symbol]}")
+
+            if task.result_callback:
+                print("[FileWorker._execute_task] Вызов result_callback для save_to_real_csv")
+                task.result_callback({"status": "saved" if success else "error"})
+                print("[FileWorker._execute_task] result_callback выполнен")
+
         elif t_type == "save_avro":
             print("[FileWorker._execute_task] Сохранение в AVRO...")
             data = task.payload.get('data')
@@ -209,10 +190,60 @@ class FileWorker:
                 
                 if task.result_callback:
                     print("[FileWorker._execute_task] Вызов result_callback для save_avro")
-                    task.result_callback({"status": "saved", "date": date.strftime('%d-%m-%Y')})
+                    task.result_callback({"status": "saved", "date": date.strftime('%Y-%m-%d')})
                     print("[FileWorker._execute_task] result_callback выполнен")
             else:
                 print("[FileWorker._execute_task] Ошибка: data пустые или date не указана")
+
+        elif t_type == "compare_symbols":
+            print("[FileWorker._execute_task] Сравнение списка символов...")
+            new_symbols = task.payload.get('symbols', [])
+            print(f"[FileWorker._execute_task] Новых символов для сравнения: {len(new_symbols)}")
+
+            if not new_symbols:
+                print("[FileWorker._execute_task] Ошибка: список символов пуст")
+                if task.error_callback:
+                    task.error_callback(ValueError("Список символов пуст для сравнения"))
+                return
+
+            try:
+                print("[FileWorker._execute_task] Вызов JsonManager.compare_symbols")
+                comparison = self.json_manager.compare_symbols(new_symbols)
+
+                added = comparison['added']
+                removed = comparison['removed']
+                unchanged = comparison['unchanged']
+
+                # --- Подробный вывод в лог ---
+                print(f"[FileWorker._execute_task] Результат сравнения:")
+                print(f"[FileWorker._execute_task]   Было в файле:  {comparison['old_count']}")
+                print(f"[FileWorker._execute_task]   Пришло от MT5: {comparison['new_count']}")
+                print(f"[FileWorker._execute_task]   added:     {len(added)}")
+                print(f"[FileWorker._execute_task]   removed:   {len(removed)}")
+                print(f"[FileWorker._execute_task]   unchanged: {len(unchanged)}")
+
+                if added:
+                    print(f"[FileWorker._execute_task]   +++ Новые символы ({len(added)}): {added}")
+                if removed:
+                    print(f"[FileWorker._execute_task]   --- Пропавшие символы ({len(removed)}): {removed}")
+                # unchanged обычно огромный — печатать не будем, только если список маленький
+                if 0 < len(unchanged) <= 20:
+                    print(f"[FileWorker._execute_task]   === Без изменений ({len(unchanged)}): {unchanged}")
+
+                if task.result_callback:
+                    print("[FileWorker._execute_task] Вызов result_callback для compare_symbols")
+                    task.result_callback({
+                        "status": "compared",
+                        "comparison": comparison,
+                    })
+                    print("[FileWorker._execute_task] result_callback выполнен")
+
+            except Exception as e:
+                print(f"[FileWorker._execute_task] Ошибка при сравнении символов: {e}")
+                if task.error_callback:
+                    task.error_callback(e)
+                else:
+                    raise
         
         elif t_type == "save_symbols":
             print("[FileWorker._execute_task] Сохранение списка символов...")
@@ -231,6 +262,26 @@ class FileWorker:
                     print("[FileWorker._execute_task] result_callback выполнен")
             else:
                 print("[FileWorker._execute_task] Ошибка: список символов пуст")
+
+        elif t_type == "reset_real_csv":
+            print("[FileWorker._execute_task] Подготовка real.csv...")
+            filename = task.payload.get('filename')
+            print(f"[FileWorker._execute_task] Файл для подготовки: {filename}")
+
+            if filename:
+                print("[FileWorker._execute_task] Вызов HistoryManager.reset_real_csv")
+                HistoryManager.reset_real_csv(filename)
+
+                # Сбрасываем счётчик дублей — файл пуст, начинаем заново
+                self._last_written_time = {}
+                print("[FileWorker._execute_task] _last_written_time сброшен в None")
+
+                if task.result_callback:
+                    print("[FileWorker._execute_task] Вызов result_callback для reset_real_csv")
+                    task.result_callback({"status": "prepared", "filename": str(filename)})
+                    print("[FileWorker._execute_task] result_callback выполнен")
+            else:
+                print("[FileWorker._execute_task] Ошибка: filename не указан")
         
         else:
             msg = f"[FileWorker._execute_task] Неизвестный тип задачи: {t_type}"

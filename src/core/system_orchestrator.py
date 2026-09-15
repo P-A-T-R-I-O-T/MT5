@@ -3,15 +3,20 @@
 import threading
 import time
 import pathlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from typing import Optional
 import pandas as pd
 
 from src.core.mt5_connection import MT5Connection
 from src.core.workers.worker_mt5 import WorkerMT5, MT5Task
 from src.core.workers.file_worker import FileWorker, FileTask
-from src.utils.history_manager import HistoryManager
-from src.utils.symbol_utils import group_and_display_symbols
+from src.utils.file_checker import TIMEFRAME_MAPPING
+from src.utils.file_checker import (
+    check_all_files_integrity,
+    is_all_files_integrity_ok,
+    collect_all_errors,
+)
+
 
 
 class SystemOrchestrator:
@@ -21,6 +26,21 @@ class SystemOrchestrator:
     """
     
     def __init__(self):
+
+        # внутри __init__, самое начало:
+        print("0 [SystemOrchestrator.__init__] Проверка целостности файлов...")
+        base_path = pathlib.Path('F:/MT5-soft')
+        integrity_results = check_all_files_integrity(base_path)
+
+        if not is_all_files_integrity_ok(integrity_results):
+            errors = collect_all_errors(integrity_results)
+            for err in errors:
+                print(f"[SystemOrchestrator.__init__] ОШИБКА: {err}")
+            raise RuntimeError(
+                f"Проверка целостности файлов не пройдена. Ошибок: {len(errors)}"
+            )
+        print("0.1 [SystemOrchestrator.__init__] Все файлы прошли проверку")
+
         print("1 [SystemOrchestrator.__init__] Инициализация SystemOrchestrator...")
 
         print("2 [SystemOrchestrator.__init__] создание FileWorker")
@@ -61,72 +81,77 @@ class SystemOrchestrator:
         self.output_file = self.base_dir / 'real.csv'
         print(f"8 [SystemOrchestrator.__init__] Базовая директория: {self.base_dir}")
         print(f"9 [SystemOrchestrator.__init__] Выходной файл: {self.output_file}")
-        print("\n" *5)
 
-        # Получаем данные из кеша FileWorker Прямой доступ к json_manager (безопасно, т.к. FileWorker готов)
-        print("[SystemOrchestrator.__init__] Получение данных из кеша...")
-        json_manager = self.file_worker.json_manager
-        
-        # Загружаем credentials из кеша
-        credentials = json_manager.load_credentials()
-        print(f"[SystemOrchestrator.__init__] Credentials загружены")
-        
-        # Получаем системные настройки из уже загруженных данных
-        system_settings = self.settings.get('system', {})
-        monitor_interval = system_settings.get('connection_monitor_interval', 30)
-        reconnection_delays = system_settings.get('reconnection_delays', [0, 10, 30, 60, 300])
-        
-        print(f"[SystemOrchestrator.__init__] Monitor interval: {monitor_interval}")
-        print(f"[SystemOrchestrator.__init__] Reconnection delays: {reconnection_delays}")
+        # --- Настройки из settings.json (разложены по секциям) ---
+        print("10 [SystemOrchestrator.__init__] Разбор настроек по секциям...")
+        self.display_settings = self.settings.get('display', {})
+        self.history_settings = self.settings.get('history', {})
+        self.shutdown_command = self.settings.get('system', {}).get('shutdown_command', '0')
+        print(f"10.1 [SystemOrchestrator.__init__] display_settings: {self.display_settings}")
+        print(f"10.2 [SystemOrchestrator.__init__] history_settings: {self.history_settings}")
+        print(f"10.3 [SystemOrchestrator.__init__] shutdown_command: '{self.shutdown_command}'")
         
         # Создаем MT5Connection
         print("[SystemOrchestrator.__init__] Создание MT5Connection...")
-        mt5_connection = MT5Connection(
-            credentials=credentials,
-            monitor_interval=monitor_interval,
-            reconnection_delays=reconnection_delays
-        )
+        mt5_connection = MT5Connection(credentials=self.credentials)
         print("[SystemOrchestrator.__init__] MT5Connection создан")
-        print("\n" *5)
 
 
 
         # Воркеры
         print("[SystemOrchestrator.__init__] Создание WorkerMT5...")
-        self.r_mt5 = WorkerMT5()
+        self.mt5_worker = WorkerMT5(
+            mt5_connection=mt5_connection,
+            settings=self.settings,
+            file_worker=self.file_worker
+        )
         print("[SystemOrchestrator.__init__] WorkerMT5 создан")
 
         
         # Состояние
         self.system_running = True
         self.is_connected = False
-        self.collection_thread: Optional[threading.Thread] = None
-        
-        # События для синхронизации
-        self._settings_checked = threading.Event()
-        self._connected = threading.Event()
-        
+
+        # --- Поток сбора данных (создаётся в _start_collection_loop) ---
+        self.collection_thread = None
+
+        # --- Последнее записанное время (защита от дублей на уровне оркестратора,
+        #     основная защита — в FileWorker._last_written_time) ---
+        self._last_written_time = None
+
         print("[SystemOrchestrator.__init__] Инициализация завершена")
         
     def start(self):
         """Запуск системы."""
-        print("\n[SystemOrchestrator.start] Запуск системы...")
+        print("[SystemOrchestrator.start] Запуск системы...")
 
-        print("[SystemOrchestrator.start] Запуск FileWorker...")
-        self.file_worker.start()
-        print("[SystemOrchestrator.start] FileWorker запущен")
-        
-        # Запускаем воркеры
+        # Запускаем WorkerMT5
         print("[SystemOrchestrator.start] Запуск WorkerMT5...")
         self.mt5_worker.start()
         print("[SystemOrchestrator.start] WorkerMT5 запущен")
-        
-        # Запускаем основной цикл в отдельном потоке
-        print("[SystemOrchestrator.start] Запуск основного цикла в отдельном потоке...")
-        self.main_thread = threading.Thread(target=self._run_system, daemon=True)
-        self.main_thread.start()
-        print(f"[SystemOrchestrator.start] Основной поток запущен с ID: {self.main_thread.ident}")
-        
+
+        # Ждём, пока WorkerMT5 завершит инициализацию
+        # (подключение к MT5 + получение списка символов).
+        # Простейший способ — дождаться, пока в WorkerMT5
+        # флаг _init_done станет True. Пока используем простую задержку.
+        print("[SystemOrchestrator.start] Ожидание инициализации WorkerMT5...")
+        init_wait = 0
+        while init_wait < 30:
+            if getattr(self.mt5_worker, '_init_done', False):
+                print("[SystemOrchestrator.start] WorkerMT5 инициализирован")
+                break
+            time.sleep(0.5)
+            init_wait += 0.5
+        else:
+            print("[SystemOrchestrator.start] ПРЕДУПРЕЖДЕНИЕ: WorkerMT5 не подтвердил инициализацию за 30 сек")
+
+        # Подготовка real.csv и запуск цикла сбора
+        print("[SystemOrchestrator.start] Подготовка real.csv...")
+        self._prepare_real_csv()
+
+        print("[SystemOrchestrator.start] Запуск цикла сбора...")
+        self._start_collection_loop()
+
         # Запускаем поток ввода команд
         print("[SystemOrchestrator.start] Запуск потока ввода команд...")
         self.input_thread = threading.Thread(
@@ -134,327 +159,136 @@ class SystemOrchestrator:
             daemon=True
         )
         self.input_thread.start()
-        print(f"[SystemOrchestrator.start] Поток ввода команд запущен с ID: {self.input_thread.ident}")
-        
+        print(f"[SystemOrchestrator.start] Поток ввода команд запущен с ID: {self.input_thread.ident}")        
+
     def stop(self):
         """Остановка системы."""
         print("\n[SystemOrchestrator.stop] Остановка системы...")
-        
+
         self.system_running = False
         print("[SystemOrchestrator.stop] Флаг system_running установлен в False")
-        
-        # Останавливаем цикл сбора
+
+        # Останавливаем поток сбора (если запущен)
         if self.collection_thread and self.collection_thread.is_alive():
-            print("[SystemOrchestrator.stop] Остановка цикла сбора...")
-            self.collection_thread.join(timeout=5)
+            print("[SystemOrchestrator.stop] Ожидание завершения потока сбора...")
+            self.collection_thread.join(timeout=3)
             if self.collection_thread.is_alive():
-                print("[SystemOrchestrator.stop] Цикл сбора не завершился за 5 секунд")
+                print("[SystemOrchestrator.stop] Поток сбора не завершился за 3 сек")
             else:
-                print("[SystemOrchestrator.stop] Цикл сбора завершен")
-        
-        # Останавливаем воркеры
+                print("[SystemOrchestrator.stop] Поток сбора завершён")
+
+        # Останавливаем WorkerMT5
         print("[SystemOrchestrator.stop] Остановка WorkerMT5...")
         self.mt5_worker.stop()
-        print("[SystemOrchestrator.stop] WorkerMT5 остановлен")
-        
+
+        # Останавливаем FileWorker
         print("[SystemOrchestrator.stop] Остановка FileWorker...")
         self.file_worker.stop()
-        print("[SystemOrchestrator.stop] FileWorker остановлен")
-        
+
         print("[SystemOrchestrator.stop] Система остановлена")
         
-    def _run_system(self):
-        """Основной цикл работы системы."""
-        print("\n[SystemOrchestrator._run_system] Запуск основного цикла...")
-        
-        # Шаг 1: Проверка настроек
-        print("[SystemOrchestrator._run_system] Переход к шагу 1: Проверка настроек")
-        if not self._check_settings():
-            print("[SystemOrchestrator._run_system] Ошибка на шаге 1, остановка")
-            self.system_running = False
-            return
-        
-        # Шаг 2: Подключение к MT5
-        print("[SystemOrchestrator._run_system] Переход к шагу 2: Подключение к MT5")
-        if not self._connect_to_mt5():
-            print("[SystemOrchestrator._run_system] Ошибка на шаге 2, остановка")
-            self.system_running = False
-            return
-        
-        # Шаг 3: Получение информации
-        print("[SystemOrchestrator._run_system] Переход к шагу 3: Получение информации")
-        self._get_terminal_and_account_info()
-        
-        # Шаг 4: Получение списка символов
-        print("[SystemOrchestrator._run_system] Переход к шагу 4: Получение списка символов")
-        self._get_symbols_list()
-        
-        # Шаг 5: Загрузка исторических данных
-        print("[SystemOrchestrator._run_system] Переход к шагу 5: Загрузка исторических данных")
-        self._load_historical_data()
-        
-        # Шаг 6: Подготовка real.csv
-        print("[SystemOrchestrator._run_system] Переход к шагу 6: Подготовка real.csv")
-        self._prepare_real_csv()
-        
-        # Шаг 7: Запуск цикла сбора данных
-        print("[SystemOrchestrator._run_system] Переход к шагу 7: Запуск цикла сбора")
-        self._start_collection_loop()
-        
-        # Ждем завершения работы
-        print("[SystemOrchestrator._run_system] Ожидание завершения работы...")
-        while self.system_running:
-            time.sleep(1)
-            
-    def _check_settings(self) -> bool:
-        """Проверка настроек через FileWorker."""
-        print("\n[SystemOrchestrator._check_settings] Шаг 1: Проверка настроек...")
-        
-        result = {}
-        settings_checked = threading.Event()
-        
-        def on_settings_checked(res):
-            print(f"[SystemOrchestrator._check_settings] Получен результат: {res}")
-            result.update(res)
-            settings_checked.set()
-        
-        print("[SystemOrchestrator._check_settings] Отправка задачи в FileWorker...")
-        self.file_worker.submit(FileTask(
-            task_type="check_settings",
-            payload={"settings": self.settings},
-            result_callback=on_settings_checked,
-            error_callback=lambda e: self._handle_error("проверки настроек", e, settings_checked)
-        ))
-        
-        # Ждем результат (максимум 10 секунд)
-        print("[SystemOrchestrator._check_settings] Ожидание результата (максимум 10 секунд)...")
-        if not settings_checked.wait(timeout=10):
-            print("[SystemOrchestrator._check_settings] Таймаут при проверке настроек")
-            return False
-        
-        valid = result.get('valid', False)
-        print(f"[SystemOrchestrator._check_settings] Результат валидации: {valid}")
-        
-        if valid:
-            print("[SystemOrchestrator._check_settings] Настройки корректны")
-        else:
-            errors = result.get('errors', [])
-            print("[SystemOrchestrator._check_settings] Найдены ошибки:")
-            for error in errors:
-                print(f"  - {error}")
-        
-        return valid
-
-
-    def _connect_to_mt5(self) -> bool:
-        """Подключение к MT5."""
-        print("\n[SystemOrchestrator._connect_to_mt5] Шаг 2: Подключение к MT5...")
-        
-        result = {}
-        connect_event = threading.Event()
-        
-        def on_connect(res):
-            print(f"[SystemOrchestrator._connect_to_mt5] Получен результат: {res}")
-            result.update(res)
-            connect_event.set()
-        
-        print("[SystemOrchestrator._connect_to_mt5] Отправка задачи подключения...")
-        self.mt5_worker.submit(MT5Task(
-            task_type="connect",
-            result_callback=on_connect,
-            error_callback=lambda e: self._handle_error("подключения к MT5", e, connect_event)
-        ))
-        
-        # Ждем результат (максимум 30 секунд)
-        print("[SystemOrchestrator._connect_to_mt5] Ожидание результата (максимум 30 секунд)...")
-        if not connect_event.wait(timeout=30):
-            print("[SystemOrchestrator._connect_to_mt5] Таймаут при подключении к MT5")
-            return False
-        
-        self.is_connected = result.get('connected', False)
-        print(f"[SystemOrchestrator._connect_to_mt5] Статус подключения: {self.is_connected}")
-        
-        if self.is_connected:
-            print("[SystemOrchestrator._connect_to_mt5] Подключение к MT5 успешно")
-        else:
-            print("[SystemOrchestrator._connect_to_mt5] Не удалось подключиться к MT5")
-        
-        return self.is_connected
-
-
     def _handle_error(self, operation: str, error: Exception, event: threading.Event):
         """Обработка ошибок с установкой события."""
         print(f"[SystemOrchestrator._handle_error] Ошибка {operation}: {error}")
         event.set()
-        
-    def _get_terminal_and_account_info(self):
-        """Получение информации о терминале и счете."""
-        print("\n[SystemOrchestrator._get_terminal_and_account_info] Шаг 3: Получение информации...")
-        
-        if self.display_settings.get('terminal_info', True):
-            print("[SystemOrchestrator._get_terminal_and_account_info] Запрос информации о терминале...")
-            self.mt5_worker.submit(MT5Task(
-                task_type="get_terminal_info",
-                result_callback=self._handle_terminal_info,
-                error_callback=lambda e: print(f"[SystemOrchestrator._get_terminal_and_account_info] Ошибка: {e}")
-            ))
-        
-        if self.display_settings.get('account_info', True):
-            print("[SystemOrchestrator._get_terminal_and_account_info] Запрос информации о счете...")
-            self.mt5_worker.submit(MT5Task(
-                task_type="get_account_info",
-                result_callback=self._handle_account_info,
-                error_callback=lambda e: print(f"[SystemOrchestrator._get_terminal_and_account_info] Ошибка: {e}")
-            ))
-            
-    def _get_symbols_list(self):
-        """Получение списка символов."""
-        print("\n[SystemOrchestrator._get_symbols_list] Шаг 4: Получение списка символов...")
-        
-        if self.display_settings.get('all_symbols', True):
-            print("[SystemOrchestrator._get_symbols_list] Запрос списка символов...")
-            self.mt5_worker.submit(MT5Task(
-                task_type="get_symbols",
-                result_callback=self._handle_symbols,
-                error_callback=lambda e: print(f"[SystemOrchestrator._get_symbols_list] Ошибка: {e}")
-            ))
-        else:
-            print("[SystemOrchestrator._get_symbols_list] Получение списка символов отключено в настройках")
-            
-    def _load_historical_data(self):
-        """Загрузка исторических данных."""
-        print("\n[SystemOrchestrator._load_historical_data] Шаг 5: Загрузка исторических данных...")
-        
+                
+    def _prepare_real_csv(self):
+        """
+        Подготовка real.csv:
+        1. Перезаписывает файл заголовками (reset_real_csv).
+        2. После успешной перезаписи — дозагружает бары за сегодня из MT5.
+        """
+        print("\n[SystemOrchestrator._prepare_real_csv] Подготовка real.csv...")
+
         if not self.history_settings.get('enabled', False):
-            print("[SystemOrchestrator._load_historical_data] Загрузка истории отключена")
+            print("[SystemOrchestrator._prepare_real_csv] История отключена в настройках")
             return
-        
+
+        print("[SystemOrchestrator._prepare_real_csv] Отправка reset_real_csv в FileWorker...")
+        self.file_worker.submit(FileTask(
+            task_type="reset_real_csv",
+            payload={"filename": self.output_file},
+            result_callback=lambda r: self._on_reset_real_csv_ready(r),
+            error_callback=lambda e: print(f"[SystemOrchestrator._prepare_real_csv] Ошибка: {e}")
+        ))
+
+    def _on_reset_real_csv_ready(self, res):
+        """Callback после успешной перезаписи real.csv — запускаем дозагрузку баров за сегодня."""
+        print(f"[SystemOrchestrator._on_reset_real_csv_ready] real.csv готов: {res}")
+        self._load_today_bars()
+
+    def _load_today_bars(self):
+        """
+        Дозагрузка баров за сегодня из MT5.
+        """
+        print("\n[SystemOrchestrator._load_today_bars] Дозагрузка баров за сегодня...")
+
         symbols = self.history_settings.get('symbols', [])
         timeframe_str = self.history_settings.get('timeframe', 'M1')
-        start_date_str = self.history_settings.get('start_date', '')
-        
-        print(f"[SystemOrchestrator._load_historical_data] Символы: {symbols}")
-        print(f"[SystemOrchestrator._load_historical_data] Таймфрейм: {timeframe_str}")
-        print(f"[SystemOrchestrator._load_historical_data] Дата начала: {start_date_str}")
-        
-        if not symbols or not start_date_str:
-            print("[SystemOrchestrator._load_historical_data] Нет символов или даты начала")
+        timeframe = TIMEFRAME_MAPPING[timeframe_str]
+
+        # Получаем серверное время MT5
+        server_now = self._get_server_time_now()
+        if server_now is None:
+            print("[SystemOrchestrator._load_today_bars] Не удалось получить серверное время, пропуск")
             return
-        
-        timeframe = HistoryManager.TIMEFRAME_MAPPING[timeframe_str]
-        start_date = self.json_manager.parse_utc_date_string(start_date_str)
-        today = datetime.now(timezone.utc).date()
-        yesterday = today - timedelta(days=1)
-        
-        print(f"[SystemOrchestrator._load_historical_data] Таймфрейм MT5: {timeframe}")
-        print(f"[SystemOrchestrator._load_historical_data] Дата начала: {start_date}")
-        print(f"[SystemOrchestrator._load_historical_data] Сегодня: {today}")
-        print(f"[SystemOrchestrator._load_historical_data] Вчера: {yesterday}")
-        
-        current_date = start_date.date()
-        days_count = 0
-        while current_date <= yesterday:
-            day_start = datetime.combine(current_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-            day_end = datetime.combine(current_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-            
-            print(f"[SystemOrchestrator._load_historical_data] Загрузка данных за {current_date}...")
-            # Собираем данные по всем символам за день
-            self._load_day_data(symbols, timeframe, day_start, day_end, current_date)
-            
-            current_date += timedelta(days=1)
-            days_count += 1
-            
-        print(f"[SystemOrchestrator._load_historical_data] Всего дней для загрузки: {days_count}")
-            
-    def _load_day_data(self, symbols, timeframe, start_time, end_time, date):
-        """Загрузка данных за конкретный день."""
-        print(f"[SystemOrchestrator._load_day_data] Загрузка данных за {date}...")
-        print(f"[SystemOrchestrator._load_day_data] Символы: {symbols}")
-        print(f"[SystemOrchestrator._load_day_data] Начало: {start_time}")
-        print(f"[SystemOrchestrator._load_day_data] Конец: {end_time}")
-        
-        all_data = []
-        
+
+        # Начало дня по серверному времени
+        day_start = server_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        last_closed_minute = server_now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+        print(f"\n\n\n\n\n\n\n[SystemOrchestrator._load_today_bars] last_closed_minute: {last_closed_minute}")
+        print(f"[SystemOrchestrator._load_today_bars] Диапазон: {day_start} — {last_closed_minute}")
+
+        print(f"[SystemOrchestrator._load_today_bars] Символы: {symbols}")
+        print(f"[SystemOrchestrator._load_today_bars] Таймфрейм: {timeframe}")
+        print(f"[SystemOrchestrator._load_today_bars] Диапазон: {day_start} — {server_now}")
+
         for symbol in symbols:
-            print(f"[SystemOrchestrator._load_day_data] Запрос данных для {symbol}...")
+            print(f"[SystemOrchestrator._load_today_bars] Запрос для {symbol}...")
             self.mt5_worker.submit(MT5Task(
                 task_type="get_historical_data",
                 payload={
                     "symbol": symbol,
                     "timeframe": timeframe,
-                    "start_date": start_time,
-                    "end_date": end_time
+                    "start_date": day_start,
+                    "end_date": last_closed_minute
                 },
-                result_callback=lambda res: self._collect_day_data(res, all_data, date),
-                error_callback=lambda e: print(f"[SystemOrchestrator._load_day_data] Ошибка: {e}")
+                result_callback=self._save_current_bars,
+                error_callback=lambda e: print(f"[SystemOrchestrator._load_today_bars] Ошибка: {e}")
             ))
-            
-    def _collect_day_data(self, res, all_data, date):
-        """Сбор данных за день и сохранение."""
-        print(f"[SystemOrchestrator._collect_day_data] Получены данные за {date}")
-        
-        if res.get('data') is not None and not res['data'].empty:
-            print(f"[SystemOrchestrator._collect_day_data] Данные не пустые: {res['data'].shape}")
-            all_data.append(res['data'])
-            print(f"[SystemOrchestrator._collect_day_data] Всего собрано: {len(all_data)} из {len(self.history_settings.get('symbols', []))}")
-            
-            # Если собрали все данные, сохраняем
-            if len(all_data) == len(self.history_settings.get('symbols', [])):
-                print("[SystemOrchestrator._collect_day_data] Все данные собраны, объединение...")
-                combined_df = pd.concat(all_data, ignore_index=True)
-                combined_df = combined_df.sort_values(['time', 'symbol'])
-                print(f"[SystemOrchestrator._collect_day_data] Объединенный DataFrame: {combined_df.shape}")
-                
-                print("[SystemOrchestrator._collect_day_data] Отправка на сохранение в AVRO...")
-                self.file_worker.submit(FileTask(
-                    task_type="save_avro",
-                    payload={"data": combined_df, "date": date},
-                    result_callback=lambda r: print(f"[SystemOrchestrator._collect_day_data] Данные за {date} сохранены"),
-                    error_callback=lambda e: print(f"[SystemOrchestrator._collect_day_data] Ошибка: {e}")
-                ))
-        else:
-            print(f"[SystemOrchestrator._collect_day_data] Данные пустые или None для {date}")
-                
-    def _prepare_real_csv(self):
-        """Подготовка real.csv."""
-        print("\n[SystemOrchestrator._prepare_real_csv] Шаг 6: Подготовка real.csv...")
-        
-        need_new_file = True
-        if self.output_file.exists():
-            print(f"[SystemOrchestrator._prepare_real_csv] Файл {self.output_file} существует")
-            last_time = HistoryManager.get_last_recorded_time(self.output_file)
-            print(f"[SystemOrchestrator._prepare_real_csv] Последняя запись: {last_time}")
-            
-            today = datetime.now(timezone.utc).date()
-            if last_time and last_time.date() == today:
-                print("[SystemOrchestrator._prepare_real_csv] Файл актуален (за сегодня)")
-                need_new_file = False
-        else:
-            print(f"[SystemOrchestrator._prepare_real_csv] Файл {self.output_file} не существует")
-                
-        if need_new_file:
-            print("[SystemOrchestrator._prepare_real_csv] Подготовка нового файла...")
-            self.file_worker.submit(FileTask(
-                task_type="prepare_real_csv",
-                payload={"filename": self.output_file},
-                result_callback=lambda r: print(f"[SystemOrchestrator._prepare_real_csv] real.csv подготовлен"),
-                error_callback=lambda e: print(f"[SystemOrchestrator._prepare_real_csv] Ошибка: {e}")
-            ))
-            
-            # Загружаем текущие бары
-            if self.history_settings.get('enabled', False):
-                symbols = self.history_settings.get('symbols', [])
-                timeframe = HistoryManager.TIMEFRAME_MAPPING[
-                    self.history_settings.get('timeframe', 'M1')
-                ]
-                
-                print(f"[SystemOrchestrator._prepare_real_csv] Загрузка текущих баров для {symbols}...")
-                self.mt5_worker.submit(MT5Task(
-                    task_type="get_current_bars",
-                    payload={"symbols": symbols, "timeframe": timeframe},
-                    result_callback=lambda res: self._save_current_bars(res),
-                    error_callback=lambda e: print(f"[SystemOrchestrator._prepare_real_csv] Ошибка: {e}")
-                ))
+
+
+    def _get_server_time_now(self):
+        """
+        Синхронно запрашивает у WorkerMT5 серверное время.
+        Возвращает naive datetime или None при таймауте.
+        """
+        print("[SystemOrchestrator._get_server_time_now] Запрос серверного времени...")
+
+        result = {}
+        event = threading.Event()
+
+        def on_result(res):
+            result.update(res)
+            event.set()
+
+        def on_error(e):
+            print(f"[SystemOrchestrator._get_server_time_now] Ошибка: {e}")
+            event.set()
+
+        self.mt5_worker.submit(MT5Task(
+            task_type="get_server_time",
+            result_callback=on_result,
+            error_callback=on_error
+        ))
+
+        if not event.wait(timeout=5):
+            print("[SystemOrchestrator._get_server_time_now] Таймаут")
+            return None
+
+        server_time = result.get("server_time")
+        print(f"[SystemOrchestrator._get_server_time_now] Получено: {server_time}")
+        return server_time
                 
     def _start_collection_loop(self):
         """Запуск цикла сбора данных."""
@@ -473,105 +307,166 @@ class SystemOrchestrator:
         print(f"[SystemOrchestrator._start_collection_loop] Поток сбора запущен с ID: {self.collection_thread.ident}")
         
     def _collection_loop(self):
-        """Цикл сбора данных."""
+        """
+        Цикл сбора данных.
+        Каждую минуту (+2 сек после закрытия) запрашивает бар за прошедшую минуту
+        и отправляет его в FileWorker для записи в real.csv.
+        Использует серверное время MT5 (не UTC).
+        При переходе через 23:59 инициирует архивацию дня.
+        """
         print("[SystemOrchestrator._collection_loop] Цикл сбора запущен")
-        
+
         symbols = self.history_settings.get('symbols', [])
-        timeframe = HistoryManager.TIMEFRAME_MAPPING[
-            self.history_settings.get('timeframe', 'M1')
-        ]
-        
+        timeframe = TIMEFRAME_MAPPING[self.history_settings.get('timeframe', 'M1')]
+
         print(f"[SystemOrchestrator._collection_loop] Символы: {symbols}")
         print(f"[SystemOrchestrator._collection_loop] Таймфрейм: {timeframe}")
-        
+
         iteration = 0
         while self.system_running:
             try:
                 iteration += 1
                 print(f"[SystemOrchestrator._collection_loop] Итерация {iteration}")
-                
-                # Синхронизация с UTC
-                utc_now = datetime.now(timezone.utc)
-                next_minute = utc_now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-                wait_time = (next_minute - utc_now).total_seconds() + 1
-                
-                print(f"[SystemOrchestrator._collection_loop] Текущее время UTC: {utc_now}")
+
+                # Синхронизация с серверным временем MT5
+                server_now = self._get_server_time_now()
+                if server_now is None:
+                    print("[SystemOrchestrator._collection_loop] Нет серверного времени, ждём 5 сек")
+                    time.sleep(5)
+                    continue
+
+                next_minute = server_now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+                wait_time = (next_minute - server_now).total_seconds() + 2
+
+                print(f"[SystemOrchestrator._collection_loop] Серверное время: {server_now}")
                 print(f"[SystemOrchestrator._collection_loop] Следующая минута: {next_minute}")
-                print(f"[SystemOrchestrator._collection_loop] Ожидание: {wait_time} секунд")
-                
+                print(f"[SystemOrchestrator._collection_loop] Ожидание: {wait_time:.2f} сек")
+
                 if wait_time > 0:
                     time.sleep(wait_time)
-                
-                # Проверка на новый день
-                print("[SystemOrchestrator._collection_loop] Проверка на новый день...")
-                self._check_new_day()
-                
-                # Получение данных за последнюю минуту
-                utc_now = datetime.now(timezone.utc)
-                minute_start = utc_now.replace(second=0, microsecond=0) - timedelta(minutes=1)
-                minute_end = utc_now.replace(second=0, microsecond=0)
-                
-                print(f"[SystemOrchestrator._collection_loop] Диапазон: {minute_start} - {minute_end}")
-                
+
+                if not self.system_running:
+                    break
+
+                # Определяем только что закрывшуюся минуту по серверному времени
+                server_now = self._get_server_time_now()
+                if server_now is None:
+                    print("[SystemOrchestrator._collection_loop] Нет серверного времени, пропуск итерации")
+                    continue
+
+             
+                # Если закрылась минута 23:59 — это конец дня
+                just_closed = server_now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+                if just_closed.hour == 23 and just_closed.minute == 59:
+                    print("[SystemOrchestrator._collection_loop] Обнаружен конец дня, запуск архивации")
+                    self._on_day_end(just_closed.date())
+
+                # Запрос бара за минуту по каждому символу
                 for symbol in symbols:
-                    print(f"[SystemOrchestrator._collection_loop] Запрос данных для {symbol}...")
+                    print(f"[SystemOrchestrator._collection_loop] Запрос для {symbol}...")
                     self.mt5_worker.submit(MT5Task(
-                        task_type="get_historical_data",
+                        task_type="get_last_closed_bar",
                         payload={
                             "symbol": symbol,
-                            "timeframe": timeframe,
-                            "start_date": minute_start,
-                            "end_date": minute_end
+                            "timeframe": timeframe
                         },
-                        result_callback=lambda res: self._save_current_bars(res),
+                        result_callback=self._save_current_bars,
                         error_callback=lambda e: print(f"[SystemOrchestrator._collection_loop] Ошибка: {e}")
                     ))
-                    
+
             except Exception as e:
                 print(f"[SystemOrchestrator._collection_loop] Ошибка в цикле сбора: {e}")
                 time.sleep(5)
-                
-    def _check_new_day(self):
-        """Проверка на новый день и архивация."""
-        print("[SystemOrchestrator._check_new_day] Проверка на новый день...")
-        utc_now = datetime.now(timezone.utc)
-        today = utc_now.date()
-        print(f"[SystemOrchestrator._check_new_day] Сегодня: {today}")
+
+        print("[SystemOrchestrator._collection_loop] Цикл сбора завершён")
+
+    def _on_day_end(self, date):
+        """
+        Обработка конца дня.
+        Запрашивает у MT5 историю за весь прошедший день (в серверном времени),
+        по готовности — сохраняет в history/YYYY-MM-DD.parquet,
+        затем очищает real.csv и дозагружает новый день.
+        """
+        print(f"\n[SystemOrchestrator._on_day_end] Конец дня {date}, архивация...")
+
+        symbols = self.history_settings.get('symbols', [])
+        timeframe = TIMEFRAME_MAPPING[self.history_settings.get('timeframe', 'M1')]
+
+        # Диапазон в серверном времени (naive datetime)
+        day_start = datetime.combine(date, datetime.min.time())
+        day_end = datetime.combine(date, datetime.max.time())
+
+        print(f"[SystemOrchestrator._on_day_end] Диапазон: {day_start} — {day_end}")
         
-        if self.output_file.exists():
-            last_time = HistoryManager.get_last_recorded_time(self.output_file)
-            print(f"[SystemOrchestrator._check_new_day] Последняя запись: {last_time}")
-            
-            if last_time and last_time.date() != today:
-                print(f"[SystemOrchestrator._check_new_day] Новый день {today}. Архивация...")
-                
-                # Архивация вчерашнего дня
-                yesterday = today - timedelta(days=1)
-                day_start = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=timezone.utc)
-                day_end = datetime.combine(yesterday, datetime.max.time()).replace(tzinfo=timezone.utc)
-                
-                print(f"[SystemOrchestrator._check_new_day] Архивация дня {yesterday}")
-                print(f"[SystemOrchestrator._check_new_day] Диапазон: {day_start} - {day_end}")
-                
-                symbols = self.history_settings.get('symbols', [])
-                timeframe = HistoryManager.TIMEFRAME_MAPPING[
-                    self.history_settings.get('timeframe', 'M1')
-                ]
-                
-                self._load_day_data(symbols, timeframe, day_start, day_end, yesterday)
-                
-                # Пересоздаем real.csv
-                print(f"[SystemOrchestrator._check_new_day] Пересоздание real.csv для {today}")
-                self.file_worker.submit(FileTask(
-                    task_type="prepare_real_csv",
-                    payload={"filename": self.output_file},
-                    result_callback=lambda r: print(f"[SystemOrchestrator._check_new_day] real.csv пересоздан для {today}"),
-                    error_callback=lambda e: print(f"[SystemOrchestrator._check_new_day] Ошибка: {e}")
-                ))
-            else:
-                print("[SystemOrchestrator._check_new_day] День не изменился")
-        else:
-            print(f"[SystemOrchestrator._check_new_day] Файл {self.output_file} не существует")
+        all_data = []
+        lock = threading.Lock()
+        expected = len(symbols)
+
+        def on_symbol_data(res):
+            with lock:
+                if res.get('data') is not None and not res['data'].empty:
+                    all_data.append(res['data'])
+                    print(f"[SystemOrchestrator._on_day_end] Собрано {len(all_data)}/{expected}")
+                else:
+                    print(f"[SystemOrchestrator._on_day_end] Пустые данные для одного из символов")
+
+                if len(all_data) >= expected:
+                    print("[SystemOrchestrator._on_day_end] Все данные собраны, архивация...")
+                    self._archive_day(date, all_data)
+
+        for symbol in symbols:
+            self.mt5_worker.submit(MT5Task(
+                task_type="get_historical_data",
+                payload={
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "start_date": day_start,
+                    "end_date": day_end
+                },
+                result_callback=on_symbol_data,
+                error_callback=lambda e: print(f"[SystemOrchestrator._on_day_end] Ошибка: {e}")
+            ))
+
+    def _archive_day(self, date, all_data):
+        """Объединяет данные и отправляет в FileWorker для сохранения в parquet."""
+        print(f"[SystemOrchestrator._archive_day] Объединение данных за {date}...")
+
+        combined_df = pd.concat(all_data, ignore_index=True)
+        combined_df = combined_df.sort_values(['time', 'symbol'])
+        print(f"[SystemOrchestrator._archive_day] Объединённый DataFrame: {combined_df.shape}")
+
+        self.file_worker.submit(FileTask(
+            task_type="save_avro",
+            payload={"data": combined_df, "date": date},
+            result_callback=lambda r: self._on_archive_success(date),
+            error_callback=lambda e: self._on_archive_error(date, e)
+        ))
+
+    def _on_archive_success(self, date):
+        """Архив сохранён — очищаем real.csv."""
+        print(f"[SystemOrchestrator._on_archive_success] Архив за {date} сохранён. Очистка real.csv...")
+
+        self.file_worker.submit(FileTask(
+            task_type="reset_real_csv",
+            payload={"filename": self.output_file},
+            result_callback=lambda r: self._on_reset_success(date),
+            error_callback=lambda e: print(f"[SystemOrchestrator._on_archive_success] Ошибка очистки: {e}")
+        ))
+
+    def _on_reset_success(self, date):
+        """real.csv очищен — дозагружаем новый день."""
+        print(f"[SystemOrchestrator._on_reset_success] real.csv очищен. Дозагрузка нового дня...")
+        self._load_today_bars()
+
+    def _on_archive_error(self, date, error):
+        """Архивация упала — real.csv НЕ трогаем, повтор через 60 сек."""
+        print(f"[SystemOrchestrator._on_archive_error] Архивация {date} упала: {error}")
+        print("[SystemOrchestrator._on_archive_error] real.csv НЕ очищен. Повтор через 60 сек...")
+
+        # Повтор через таймер
+        retry_timer = threading.Timer(60.0, lambda: self._on_day_end(date))
+        retry_timer.daemon = True
+        retry_timer.start()
                 
     def _save_current_bars(self, res):
         """Сохранение текущих баров в real.csv."""
@@ -678,69 +573,81 @@ class SystemOrchestrator:
         print(f"  status - статус системы")
         print(f"  exit - выход из программы")
 
-    def _check_files_integrity(self) -> bool:
-        """Шаг 0: Проверка целостности файлов."""
-        print("\n[SystemOrchestrator._check_files_integrity] Шаг 0: Проверка целостности...")
-        
-        result = {}
-        check_event = threading.Event()
-        
-        def on_check_result(res):
-            print(f"[SystemOrchestrator._check_files_integrity] Результат: {res}")
-            result.update(res)
-            check_event.set()
-        
-        # Отправляем задачу в FileWorker
-        self.file_worker.submit(FileTask(
-            task_type="check_integrity",
-            result_callback=on_check_result,
-            error_callback=lambda e: self._handle_error("проверки целостности", e, check_event)
-        ))
-        
-        # Ждем результат
-        if not check_event.wait(timeout=10):
-            print("[SystemOrchestrator._check_files_integrity] Таймаут")
-            return False
-        
-        # Проверяем результаты
-        all_ok = all(result.values())
-        print(f"[SystemOrchestrator._check_files_integrity] Все проверки пройдены: {all_ok}")
-        
-        if not all_ok:
-            print("[SystemOrchestrator._check_files_integrity] Найдены проблемы:")
-            for key, value in result.items():
-                if not value:
-                    print(f"  - {key}: FAILED")
-        
-        return all_ok
-
     def _load_data_via_file_worker(self, task_type: str, result_key: str):
+        
         """
         Универсальный метод загрузки данных через FileWorker.
+        
+        Метод выполняет следующие шаги:
+        1. Создает контейнер для результата и событие синхронизации
+        2. Определяет callback-функцию для получения результата
+        3. Отправляет задачу в FileWorker (асинхронно)
+        4. Ожидает завершения задачи (максимум 10 секунд)
+        5. Возвращает полученные данные
         
         :param task_type: тип задачи ('load_settings', 'load_credentials')
         :param result_key: ключ для извлечения результата ('settings', 'credentials')
         :return: загруженные данные
         """
         print(f"[SystemOrchestrator._load_data_via_file_worker] Загрузка {result_key}...")
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Тип задачи: {task_type}")
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Ключ результата: {result_key}")
         
+        # Шаг 1: Создаем словарь для хранения результата
+        # Сюда callback-функция положит данные
         result = {}
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Создан контейнер для результата: {result}")
+        
+        # Шаг 2: Создаем событие для синхронизации потоков
+        # Событие будет установлено, когда результат будет получен
         event = threading.Event()
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Создано событие синхронизации: {event}")
         
+        # Шаг 3: Определяем callback-функцию
+        # Она будет вызвана FileWorker'ом, когда задача будет выполнена
         def on_result(res):
+            print(f"[SystemOrchestrator._load_data_via_file_worker] Получен результат от FileWorker: {res}")
+            
+            # Копируем все данные из результата в наш контейнер
             result.update(res)
+            print(f"[SystemOrchestrator._load_data_via_file_worker] Результат обновлен: {result}")
+            
+            # Устанавливаем событие - сигнализируем, что результат готов
             event.set()
+            print(f"[SystemOrchestrator._load_data_via_file_worker] Событие установлено - результат готов")
         
-        # Отправляем задачу в FileWorker
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Callback-функция определена")
+        
+        # Шаг 4: Отправляем задачу в FileWorker
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Отправка задачи '{task_type}' в FileWorker...")
+        
         self.file_worker.submit(FileTask(
-            task_type=task_type,
-            result_callback=on_result,
-            error_callback=lambda e: self._handle_error(f"загрузки {result_key}", e, event)
+            task_type=task_type,  # Тип задачи, например 'load_settings'
+            result_callback=on_result,  # Callback для успешного выполнения
+            error_callback=lambda e: self._handle_error(f"загрузки {result_key}", e, event)  # Callback для ошибки
         ))
         
-        # Ждем результат
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Задача '{task_type}' отправлена в очередь FileWorker")
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Ожидание результата (максимум 10 секунд)...")
+        
+        # Шаг 5: Ждем, пока событие не будет установлено (или таймаут 10 секунд)
         if not event.wait(timeout=10):
-            print(f"[SystemOrchestrator._load_data_via_file_worker] Таймаут при загрузке {result_key}")
+            # Если таймаут истек, а событие не установлено
+            print(f"[SystemOrchestrator._load_data_via_file_worker] ТАЙМАУТ при загрузке {result_key}")
+            print(f"[SystemOrchestrator._load_data_via_file_worker] FileWorker не ответил за 10 секунд")
             return {}
         
-        return result.get(result_key, {})
+        # Шаг 6: Событие установлено - извлекаем данные
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Событие установлено, извлекаем данные...")
+        
+        # Достаем данные по ключу (например 'settings' или 'credentials')
+        loaded_data = result.get(result_key, {})
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Данные по ключу '{result_key}': {loaded_data}")
+        
+        # Если данные пустые, выводим предупреждение
+        if not loaded_data:
+            print(f"[SystemOrchestrator._load_data_via_file_worker] ВНИМАНИЕ: Данные по ключу '{result_key}' пустые или отсутствуют")
+            print(f"[SystemOrchestrator._load_data_via_file_worker] Содержимое result: {result}")
+        
+        print(f"[SystemOrchestrator._load_data_via_file_worker] Загрузка {result_key} завершена")
+        return loaded_data

@@ -2,15 +2,22 @@
 
 import json
 import pathlib
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import time
 from datetime import datetime, timedelta, timezone
 
+# Импортируем функции проверки из file_checker
+from src.utils.file_checker import (TIMEFRAME_MAPPING)
+
 
 class JsonManager:
-    """Единый класс для работы с JSON‑конфигурациями и данными."""
+    """Единый класс для работы с JSON-конфигурациями и данными."""
+
+    # Используем TIMEFRAME_MAPPING из file_checker
+    TIMEFRAME_MAPPING = TIMEFRAME_MAPPING
 
     def __init__(self, base_path: str = 'F:/MT5-soft'):
+        """Инициализация JsonManager."""
         print("1 [JsonManager.__init__] Инициализация JsonManager...")
         
         self.base_path = pathlib.Path(base_path)
@@ -21,7 +28,7 @@ class JsonManager:
         self._credentials_cache = None
         print("4 [JsonManager.__init__] Кеш учётных данных созданы / пустые")
 
-        # Добавить пути к файлам
+        # Пути к файлам
         self.settings_path = self.base_path / 'config' / 'settings.json'
         self.credentials_path = self.base_path / 'config' / 'credentials.json'
         self.symbols_list_path = self.base_path / 'config' / 'symbols_list.json'
@@ -31,7 +38,7 @@ class JsonManager:
         print("6 [JsonManager.__init__] Инициализация завершена")
 
     def _load_json_file(self, file_path: pathlib.Path) -> Dict[str, Any]:
-        """Загружает JSON‑файл с обработкой ошибок."""
+        """Загружает JSON-файл с обработкой ошибок."""
         print(f"[JsonManager._load_json_file] Загрузка файла: {file_path}")
         
         try:
@@ -54,7 +61,7 @@ class JsonManager:
             return {}
 
     def _save_json_file(self, data: Any, file_path: pathlib.Path) -> bool:
-        """Сохраняет данные в JSON‑файл с обработкой ошибок."""
+        """Сохраняет данные в JSON-файл с обработкой ошибок."""
         print(f"[JsonManager._save_json_file] Сохранение данных в файл: {file_path}")
         print(f"[JsonManager._save_json_file] Данные: {data}")
         
@@ -124,10 +131,9 @@ class JsonManager:
             return self._settings_cache
 
         print("[JsonManager.load_settings] Кеш пуст, загрузка из файла...")
-        settings_path = self.base_path / 'config' / 'settings.json'
-        print(f"[JsonManager.load_settings] Путь к файлу: {settings_path}")
+        print(f"[JsonManager.load_settings] Путь к файлу: {self.settings_path}")
         
-        self._settings_cache = self._load_json_file(settings_path)
+        self._settings_cache = self._load_json_file(self.settings_path)
         print(f"[JsonManager.load_settings] Настройки загружены в кеш: {self._settings_cache}")
         return self._settings_cache
 
@@ -158,10 +164,9 @@ class JsonManager:
             return self._credentials_cache
 
         print("[JsonManager.load_credentials] Кеш пуст, загрузка из файла...")
-        credentials_path = self.base_path / 'config' / 'credentials.json'
-        print(f"[JsonManager.load_credentials] Путь к файлу: {credentials_path}")
+        print(f"[JsonManager.load_credentials] Путь к файлу: {self.credentials_path}")
         
-        self._credentials_cache = self._load_json_file(credentials_path)
+        self._credentials_cache = self._load_json_file(self.credentials_path)
         print(f"[JsonManager.load_credentials] Учетные данные загружены: {self._credentials_cache}")
         return self._credentials_cache
 
@@ -170,16 +175,38 @@ class JsonManager:
     def load_symbols_list(self) -> List[str]:
         """Загружает список символов из symbols_list.json."""
         print("[JsonManager.load_symbols_list] Загрузка списка символов...")
-        symbols_path = self.base_path / 'config' / 'symbols_list.json'
-        print(f"[JsonManager.load_symbols_list] Путь к файлу: {symbols_path}")
+        print(f"[JsonManager.load_symbols_list] Путь к файлу: {self.symbols_list_path}")
         
-        data = self._load_json_file(symbols_path)
+        data = self._load_json_file(self.symbols_list_path)
         if isinstance(data, list):
             print(f"[JsonManager.load_symbols_list] Загружено символов: {len(data)}")
             return data
         else:
             print("[JsonManager.load_symbols_list] Ошибка: symbols_list.json должен содержать массив строк.")
             return []
+
+    def compare_symbols(self, new_symbols: List[str]) -> dict:
+        """Сравнивает текущий symbols_list.json с новым списком."""
+        print("[JsonManager.compare_symbols] Сравнение символов...")
+        old_symbols = self.load_symbols_list()
+        old_set = set(old_symbols)
+        new_set = set(new_symbols)
+
+        result = {
+            'added': sorted(new_set - old_set),      # появились в MT5
+            'removed': sorted(old_set - new_set),    # исчезли из MT5
+            'unchanged': sorted(old_set & new_set),  # остались
+            'old_count': len(old_set),
+            'new_count': len(new_set),
+        }
+
+        print(f"[JsonManager.compare_symbols] old={result['old_count']}, "
+            f"new={result['new_count']}, "
+            f"added={len(result['added'])}, "
+            f"removed={len(result['removed'])}, "
+            f"unchanged={len(result['unchanged'])}")
+
+        return result
 
     def save_symbols_to_json(self, symbols: List[Any], json_file_path: Optional[str] = None) -> bool:
         """Сохраняет список названий символов в JSON."""
@@ -193,7 +220,7 @@ class JsonManager:
 
         # Если путь не указан, используем стандартный
         if json_file_path is None:
-            json_file_path = str(self.base_path / 'config' / 'symbols_list.json')
+            json_file_path = str(self.symbols_list_path)
             print(f"[JsonManager.save_symbols_to_json] Используем стандартный путь: {json_file_path}")
 
         json_path = pathlib.Path(json_file_path)
@@ -219,9 +246,8 @@ class JsonManager:
   
     def parse_utc_date_string(self, date_string: str) -> datetime:
         """
-        Парсит строку даты в формате YYYY-MM-DD как UTC дату.
+        Парсит строку даты в формате DD-MM-YYYY как UTC дату.
         Время устанавливается в 00:00:00 UTC.
-        Никаких конвертаций из локального времени нет.
         """
         print(f"[JsonManager.parse_utc_date_string] Парсинг даты: {date_string}")
         
@@ -239,123 +265,3 @@ class JsonManager:
             print(f"[JsonManager.parse_utc_date_string] Ошибка парсинга: {e}")
             raise ValueError(f"Неверный формат даты '{date_string}': {e}")
 
-        # === МЕТОДЫ ПРОВЕРКИ ЦЕЛОСТНОСТИ ===
-    
-    def check_all_files_integrity(self) -> Dict[str, Any]:
-        """Проверяет целостность всех файлов и каталогов."""
-        print("[JsonManager.check_all_files_integrity] Начало проверки целостности...")
-        
-        results = {
-            'history_dir': self.check_history_dir(),
-            'settings_file': self.check_settings_file(),
-            'credentials_file': self.check_credentials_file(),
-            'symbols_list_file': self.check_symbols_list_file(),
-            'real_csv': self.check_real_csv(),
-        }
-        
-        print(f"[JsonManager.check_all_files_integrity] Результаты: {results}")
-        
-        # Проверяем, все ли True
-        all_ok = all(results.values())
-        print(f"[JsonManager.check_all_files_integrity] Все проверки пройдены: {all_ok}")
-        
-        return results
-    
-    def check_history_dir(self) -> bool:
-        """Проверяет и создает директорию history."""
-        print(f"[JsonManager.check_history_dir] Проверка директории: {self.history_dir}")
-        
-        if self.history_dir.exists():
-            print(f"[JsonManager.check_history_dir] Директория {self.history_dir} существует")
-            return True
-        
-        try:
-            self.history_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[JsonManager.check_history_dir] Директория {self.history_dir} создана")
-            return True
-        except Exception as e:
-            print(f"[JsonManager.check_history_dir] Ошибка: {e}")
-            return False
-    
-    def check_settings_file(self) -> bool:
-        """Проверяет settings.json. Если нет - создает с настройками по умолчанию."""
-        print(f"[JsonManager.check_settings_file] Проверка: {self.settings_path}")
-        
-        if self.settings_path.exists():
-            print(f"[JsonManager.check_settings_file] Файл {self.settings_path} существует")
-            return True
-        
-        default_settings = {
-            "system": {
-                "shutdown_command": "0",
-                "connection_monitor_interval": 30,
-                "reconnection_delays": [0, 10, 30, 60, 300]
-            },
-            "display": {
-                "terminal_info": True,
-                "account_info": True,
-                "all_symbols": True,
-                "symbol_details": False,
-                "grouped_symbols": False
-            },
-            "history": {
-                "enabled": True,
-                "start_date": "2026-08-10",
-                "timeframe": "M1",
-                "symbols": ["GBPUSD"],
-                "mode": "custom",
-                "symbols_directories": "off"
-            }
-        }
-        
-        print(f"[JsonManager.check_settings_file] Создание settings.json с настройками по умолчанию")
-        return self._save_json_file(default_settings, self.settings_path)
-    
-    def check_credentials_file(self) -> bool:
-        """Проверяет credentials.json. Если нет - создает шаблон."""
-        print(f"[JsonManager.check_credentials_file] Проверка: {self.credentials_path}")
-        
-        if self.credentials_path.exists():
-            print(f"[JsonManager.check_credentials_file] Файл {self.credentials_path} существует")
-            return True
-        
-        template = {
-            "login": "",
-            "password": "",
-            "server": ""
-        }
-        
-        print(f"[JsonManager.check_credentials_file] Создание credentials.json с шаблоном")
-        return self._save_json_file(template, self.credentials_path)
-    
-    def check_symbols_list_file(self) -> bool:
-        """Проверяет symbols_list.json. Если нет - создает пустой список."""
-        print(f"[JsonManager.check_symbols_list_file] Проверка: {self.symbols_list_path}")
-        
-        if self.symbols_list_path.exists():
-            print(f"[JsonManager.check_symbols_list_file] Файл {self.symbols_list_path} существует")
-            return True
-        
-        print(f"[JsonManager.check_symbols_list_file] Создание symbols_list.json с пустым списком")
-        return self._save_json_file([], self.symbols_list_path)
-    
-    def check_real_csv(self) -> bool:
-        """Проверяет real.csv. Если нет - создает с заголовками."""
-        print(f"[JsonManager.check_real_csv] Проверка: {self.real_csv_path}")
-        
-        if self.real_csv_path.exists():
-            print(f"[JsonManager.check_real_csv] Файл {self.real_csv_path} существует")
-            return True
-        
-        required_columns = ['time', 'open', 'high', 'low', 'close', 
-                        'tick_volume', 'spread', 'real_volume', 'symbol']
-        
-        try:
-            self.real_csv_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.real_csv_path, 'w', newline='', encoding='utf-8') as f:
-                f.write(','.join(required_columns) + '\n')
-            print(f"[JsonManager.check_real_csv] Файл {self.real_csv_path} создан")
-            return True
-        except Exception as e:
-            print(f"[JsonManager.check_real_csv] Ошибка: {e}")
-            return False
