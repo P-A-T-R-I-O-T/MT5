@@ -8,5 +8,7 @@ credentials.txt
 данные.txt
 project.txt
 scan.py
+parquet_csv.py
 __init__.py
 symbols_list.json
+credentials.py

@@ -1,18 +1,30 @@
 # src/core/file_worker.py
 import threading
 import queue
+import pathlib
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
-from src.utils.json_manager import JsonManager
+from datetime import date, datetime, timezone
+import pandas as pd
+import time 
+
+from collections import defaultdict
+
+
 from src.utils.history_manager import HistoryManager
-import pathlib
-from datetime import datetime
+from src.utils.symbols_manager import (
+    load_symbols as _load_symbols_file,
+    save_symbols as _save_symbols_file,
+    compare_symbols as _compare_symbols,
+)
+from config.settings import SYMBOLS_LIST_PATH
 
 @dataclass
 class FileTask:
     """Тип задачи для файлового воркера."""
-    task_type: str  # 'load_settings', 'load_credentials', 'prepare_real_csv',
-                # 'save_to_real_csv', 'save_avro', 'save_symbols'
+    task_type: str  # 'load_credentials', 'prepare_real_csv',
+            # 'save_to_real_csv', 'save_daily_parquet',
+            # 'save_symbols', 'compare_symbols', 'reset_real_csv'
     payload: Optional[Dict[str, Any]] = field(default_factory=dict)
     result_callback: Optional[callable] = None
     error_callback: Optional[callable] = None
@@ -22,21 +34,30 @@ class FileWorker:
 
         print("1 [FileWorker.__init__] Инициализация FileWorker...")
 
-        print("2 [FileWorker.__init__] инициализация _json_manager_ready")
-        self._json_manager_ready = threading.Event()
-        print("2 [FileWorker.__init__] инициализация _json_manager_ready завершилась")
-  
+        self._ready = threading.Event()
         self._queue: queue.Queue[FileTask] = queue.Queue()
         self._stop_flag = False
         self._thread: Optional[threading.Thread] = None
         self._is_running = False
 
         self.base_dir = pathlib.Path('F:/MT5-soft/history')
-
-        # Последнее записанное время в real.csv — для защиты от дублей
         self._last_written_time: Dict[str, datetime] = {}
 
+        # --- Буфер для старших ТФ: {tf: {date: {symbol: [bar_dict, ...]}}} ---
+        self._tf_buffer: Dict[str, Dict[date, Dict[str, list]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(list))
+        )
+
+        # Для каждого (tf, symbol) запоминаем текущую дату, чтобы понять,
+        # когда нужно сбросить вчерашний день
+        self._tf_current_date: Dict[tuple, date] = {}
+
+        # Время последнего flush по таймеру
+        self._tf_last_flush_ts = time.time()
+        self._tf_flush_interval_sec = 60  # раз в минуту
+
         print("2 [FileWorker.__init__] Инициализация завершена")
+
         
     def start(self):
         print("[FileWorker.start] Запуск FileWorker...")
@@ -52,6 +73,11 @@ class FileWorker:
 
     def stop(self):
         print("[FileWorker.stop] Остановка FileWorker...")
+
+        # Принудительный сброс буферов старших ТФ
+        print("[FileWorker.stop] Финальный сброс буферов старших ТФ...")
+        self._flush_tf_buffer(force=True)
+
         self._stop_flag = True
         self._is_running = False
         if self._thread:
@@ -71,19 +97,17 @@ class FileWorker:
 
     def _run_loop(self):
         print("[1 FileWorker._run_loop] Запуск цикла обработки задач...")
-
-        # Создаем JsonManager внутри потока
-        print("2 [FileWorker._run_loop] Инициализация JsonManager...")
-        self.json_manager = JsonManager()
-        print("3 [FileWorker._run_loop] JsonManager создан")
-
-        # Устанавливаем событие готовности
-        self._json_manager_ready.set()
-        print("4 [FileWorker._run_loop] JsonManager готов к работе")
+        self._ready.set()
+        print("2 [FileWorker._run_loop] FileWorker готов к работе")
 
         processed_tasks = 0
         
         while not self._stop_flag:
+            # Периодический flush старших ТФ (только для прошедших дней)
+            now = time.time()
+            if now - self._tf_last_flush_ts >= self._tf_flush_interval_sec:
+                self._flush_tf_buffer(force=False)
+                self._tf_last_flush_ts = now
             try:
                 task = self._queue.get(timeout=0.5)
                 print(f"[FileWorker._run_loop] Получена задача: {task.task_type}")
@@ -114,154 +138,163 @@ class FileWorker:
         t_type = task.task_type
         print(f"[FileWorker._execute_task] Начало выполнения задачи: {t_type}")
         print(f"[FileWorker._execute_task] Payload: {task.payload}")
-
-        if t_type == "load_settings":
-            print("[FileWorker._execute_task] Загрузка настроек...")
-            settings = self.json_manager.load_settings()
-            
-            if task.result_callback:
-                task.result_callback({"settings": settings})
-
-        elif t_type == "load_credentials":  
-            print("[FileWorker._execute_task] Загрузка учетных данных...")
-            credentials = self.json_manager.load_credentials()
-            
-            if task.result_callback:
-                task.result_callback({"credentials": credentials})
         
-        elif t_type == "save_to_real_csv":
-            print("[FileWorker._execute_task] Сохранение данных в real.csv...")
+        if t_type == "save_to_real_csv":
             data = task.payload.get('data')
             filename = task.payload.get('filename')
-            print(f"[FileWorker._execute_task] Файл: {filename}")
-            print(f"[FileWorker._execute_task] Данные: {data.shape if data is not None else 'None'}")
+            tf_str = task.payload.get('timeframe', 'M1')
 
-            if data is None or filename is None:
-                print("[FileWorker._execute_task] Ошибка: data или filename не указаны")
-                return
-
-            # --- Фильтр дублей (по каждому символу отдельно) ---
-            if data.empty:
-                print("[FileWorker._execute_task] Пустой DataFrame, пропуск")
-                return
-
-            # В одной задаче все бары — по одному символу
-            symbol = data['symbol'].iloc[0]
-            last_time = self._last_written_time.get(symbol)
-
-            if last_time is not None:
-                before = len(data)
-                data = data[data['time'] > last_time]
-                print(f"[FileWorker._execute_task] Фильтр дублей [{symbol}]: {before} -> {len(data)} записей")
-
-            if data.empty:
-                print(f"[FileWorker._execute_task] Все бары [{symbol}] уже записаны, пропуск")
+            if data is None or filename is None or data.empty:
                 if task.result_callback:
                     task.result_callback({"status": "skipped"})
                 return
 
-            # --- Запись ---
-            print("[FileWorker._execute_task] Вызов HistoryManager.append_to_real_csv")
-            success = HistoryManager.append_to_real_csv(data, filename)
-            print(f"[FileWorker._execute_task] Результат сохранения: {success}")
+            symbol = data['symbol'].iloc[0]
+            # Ключ дедупа теперь (symbol, timeframe)
+            key = (symbol, tf_str)
+            last_time = self._last_written_time.get(key)
 
+            if last_time is not None:
+                before = len(data)
+                data = data[data['time'] > last_time]
+                print(f"[FileWorker] Фильтр дублей {key}: {before} -> {len(data)}")
+
+            if data.empty:
+                if task.result_callback:
+                    task.result_callback({"status": "skipped"})
+                return
+
+            success = HistoryManager.append_to_real_csv(data, filename)
             if success:
-                # Обновляем _last_written_time для этого символа
-                self._last_written_time[symbol] = data['time'].max()
-                print(f"[FileWorker._execute_task] _last_written_time[{symbol}] = {self._last_written_time[symbol]}")
+                self._last_written_time[key] = data['time'].max()
 
             if task.result_callback:
-                print("[FileWorker._execute_task] Вызов result_callback для save_to_real_csv")
                 task.result_callback({"status": "saved" if success else "error"})
-                print("[FileWorker._execute_task] result_callback выполнен")
 
-        elif t_type == "save_avro":
-            print("[FileWorker._execute_task] Сохранение в AVRO...")
-            data = task.payload.get('data')
-            date = task.payload.get('date')
-            base_dir = task.payload.get('base_dir', self.base_dir)
-            print(f"[FileWorker._execute_task] Дата: {date}")
-            print(f"[FileWorker._execute_task] Директория: {base_dir}")
-            print(f"[FileWorker._execute_task] Данные: {data.shape if data is not None else 'None'}")
-            
-            if data is not None and not data.empty and date:
-                print("[FileWorker._execute_task] Вызов HistoryManager.save_daily_data_avro")
-                HistoryManager.save_daily_data_avro(data, date, base_dir)
-                
+        elif t_type == "save_daily_parquet":
+                print("[FileWorker._execute_task] Сохранение дневного parquet...")
+                data = task.payload.get('data')
+                date = task.payload.get('date')
+                base_dir = task.payload.get('base_dir', self.base_dir)
+                timeframe = task.payload.get('timeframe', 'M1')          # ← НОВОЕ
+                print(f"[FileWorker._execute_task] Дата: {date}")
+                print(f"[FileWorker._execute_task] Таймфрейм: {timeframe}")  # ← НОВОЕ
+                print(f"[FileWorker._execute_task] Директория: {base_dir}")
+                print(f"[FileWorker._execute_task] Данные: {data.shape if data is not None else 'None'}")
+
+                if data is not None and not data.empty and date:
+                    success = HistoryManager.save_daily_parquet(
+                        df=data,
+                        date=date,
+                        base_dir=base_dir,
+                        timeframe=timeframe
+                    )
+                    if task.result_callback:
+                        task.result_callback({
+                            "status": "saved" if success else "error",
+                            "date": date.strftime('%Y-%m-%d')
+                        })
+                else:
+                    print("[FileWorker._execute_task] Ошибка: data пустые или date не указана")
+                    if task.result_callback:
+                        task.result_callback({"status": "error"})
+
+        elif t_type == "save_tf_bar":
+            print("[FileWorker._execute_task] Буферизация закрытого бара старшего ТФ...")
+            symbol = task.payload.get('symbol')
+            timeframe = task.payload.get('timeframe')
+            bar = task.payload.get('bar')
+
+            if not all([symbol, timeframe, bar]):
+                msg = "save_tf_bar: нужны symbol, timeframe, bar"
+                print(f"[FileWorker._execute_task] Ошибка: {msg}")
+                if task.error_callback:
+                    task.error_callback(ValueError(msg))
+                return
+
+            if timeframe not in ("M5", "M15", "H1", "D1"):
+                msg = f"save_tf_bar: неподдерживаемый timeframe {timeframe}"
+                print(f"[FileWorker._execute_task] Ошибка: {msg}")
+                if task.error_callback:
+                    task.error_callback(ValueError(msg))
+                return
+
+            bar_time = bar.get('time')
+            if bar_time is None:
+                msg = "save_tf_bar: бар без time"
+                print(f"[FileWorker._execute_task] Ошибка: {msg}")
+                if task.error_callback:
+                    task.error_callback(ValueError(msg))
+                return
+
+            if isinstance(bar_time, pd.Timestamp):
+                bar_time = bar_time.to_pydatetime()
+            bar_date = bar_time.date()
+
+            # Кладём в буфер
+            self._tf_buffer[timeframe][bar_date][symbol].append(dict(bar, symbol=symbol))
+
+            # Если для этого (tf, symbol) уже есть другая дата — сбрасываем её
+            key = (timeframe, symbol)
+            prev_date = self._tf_current_date.get(key)
+            if prev_date is not None and prev_date != bar_date:
+                # Сбрасываем прошедшую дату
+                self._flush_tf_date(timeframe, prev_date)
+
+            self._tf_current_date[key] = bar_date
+
+            print(f"[FileWorker._execute_task] Буферизован {symbol} {timeframe} @ {bar_time}")
+
+            if task.result_callback:
+                task.result_callback({"status": "buffered"})
+
+        elif t_type == "append_to_single_parquet":
+            df = task.payload.get('data')
+            file_path = task.payload.get('file_path')
+            if df is not None and not df.empty and file_path:
+                ok = HistoryManager.append_to_single_parquet(df, pathlib.Path(file_path))
                 if task.result_callback:
-                    print("[FileWorker._execute_task] Вызов result_callback для save_avro")
-                    task.result_callback({"status": "saved", "date": date.strftime('%Y-%m-%d')})
-                    print("[FileWorker._execute_task] result_callback выполнен")
+                    task.result_callback({"status": "saved" if ok else "error"})
             else:
-                print("[FileWorker._execute_task] Ошибка: data пустые или date не указана")
+                if task.result_callback:
+                    task.result_callback({"status": "error"})
+
+        elif t_type == "load_symbols":
+            print("[FileWorker._execute_task] Загрузка символов из txt...")
+            symbols = _load_symbols_file(SYMBOLS_LIST_PATH)
+            if task.result_callback:
+                task.result_callback({"symbols": symbols})
 
         elif t_type == "compare_symbols":
             print("[FileWorker._execute_task] Сравнение списка символов...")
             new_symbols = task.payload.get('symbols', [])
-            print(f"[FileWorker._execute_task] Новых символов для сравнения: {len(new_symbols)}")
-
             if not new_symbols:
-                print("[FileWorker._execute_task] Ошибка: список символов пуст")
                 if task.error_callback:
                     task.error_callback(ValueError("Список символов пуст для сравнения"))
                 return
 
-            try:
-                print("[FileWorker._execute_task] Вызов JsonManager.compare_symbols")
-                comparison = self.json_manager.compare_symbols(new_symbols)
+            old_symbols = _load_symbols_file(SYMBOLS_LIST_PATH)
+            comparison = _compare_symbols(old_symbols, new_symbols)
 
-                added = comparison['added']
-                removed = comparison['removed']
-                unchanged = comparison['unchanged']
+            print(f"[FileWorker._execute_task]   Было в файле:  {comparison['old_count']}")
+            print(f"[FileWorker._execute_task]   Пришло от MT5: {comparison['new_count']}")
+            print(f"[FileWorker._execute_task]   added: {len(comparison['added'])}")
+            print(f"[FileWorker._execute_task]   removed: {len(comparison['removed'])}")
+            if comparison['added']:
+                print(f"[FileWorker._execute_task]   +++ {comparison['added']}")
+            if comparison['removed']:
+                print(f"[FileWorker._execute_task]   --- {comparison['removed']}")
 
-                # --- Подробный вывод в лог ---
-                print(f"[FileWorker._execute_task] Результат сравнения:")
-                print(f"[FileWorker._execute_task]   Было в файле:  {comparison['old_count']}")
-                print(f"[FileWorker._execute_task]   Пришло от MT5: {comparison['new_count']}")
-                print(f"[FileWorker._execute_task]   added:     {len(added)}")
-                print(f"[FileWorker._execute_task]   removed:   {len(removed)}")
-                print(f"[FileWorker._execute_task]   unchanged: {len(unchanged)}")
-
-                if added:
-                    print(f"[FileWorker._execute_task]   +++ Новые символы ({len(added)}): {added}")
-                if removed:
-                    print(f"[FileWorker._execute_task]   --- Пропавшие символы ({len(removed)}): {removed}")
-                # unchanged обычно огромный — печатать не будем, только если список маленький
-                if 0 < len(unchanged) <= 20:
-                    print(f"[FileWorker._execute_task]   === Без изменений ({len(unchanged)}): {unchanged}")
-
-                if task.result_callback:
-                    print("[FileWorker._execute_task] Вызов result_callback для compare_symbols")
-                    task.result_callback({
-                        "status": "compared",
-                        "comparison": comparison,
-                    })
-                    print("[FileWorker._execute_task] result_callback выполнен")
-
-            except Exception as e:
-                print(f"[FileWorker._execute_task] Ошибка при сравнении символов: {e}")
-                if task.error_callback:
-                    task.error_callback(e)
-                else:
-                    raise
+            if task.result_callback:
+                task.result_callback({"status": "compared", "comparison": comparison})
         
         elif t_type == "save_symbols":
-            print("[FileWorker._execute_task] Сохранение списка символов...")
+            print("[FileWorker._execute_task] Сохранение символов в txt...")
             symbols = task.payload.get('symbols', [])
-            print(f"[FileWorker._execute_task] Символы: {symbols}")
-            print(f"[FileWorker._execute_task] Количество символов: {len(symbols)}")
-            
-            if symbols:
-                print("[FileWorker._execute_task] Вызов JsonManager.save_symbols_to_json")
-                success = self.json_manager.save_symbols_to_json(symbols)
-                print(f"[FileWorker._execute_task] Результат сохранения: {success}")
-                
-                if task.result_callback:
-                    print("[FileWorker._execute_task] Вызов result_callback для save_symbols")
-                    task.result_callback({"status": "saved" if success else "error", "count": len(symbols)})
-                    print("[FileWorker._execute_task] result_callback выполнен")
-            else:
-                print("[FileWorker._execute_task] Ошибка: список символов пуст")
+            success = _save_symbols_file(SYMBOLS_LIST_PATH, symbols)
+            if task.result_callback:
+                task.result_callback({"status": "saved" if success else "error",
+                                    "count": len(symbols)})
 
         elif t_type == "reset_real_csv":
             print("[FileWorker._execute_task] Подготовка real.csv...")
@@ -293,13 +326,83 @@ class FileWorker:
         
         print(f"[FileWorker._execute_task] Завершение выполнения задачи: {t_type}")
 
+    def _flush_tf_buffer(self, force: bool) -> None:
+        """
+        Сбрасывает буферы старших ТФ на диск.
 
-    def wait_for_json_manager(self, timeout=10):
-        """Ожидает готовности JsonManager."""
-        print("[FileWorker.wait_for_json_manager] Ожидание готовности JsonManager...")
-        if self._json_manager_ready.wait(timeout=timeout):
-            print("[FileWorker.wait_for_json_manager] JsonManager готов")
-            return True
+        force=True  — сбрасываем ВСЁ, включая текущий день.
+        force=False — только прошедшие дни (текущий оставляем).
+        """
+        today = datetime.now(timezone.utc).date()
+
+        # Собираем список (tf, date) для сброса
+        to_flush = []
+        for tf, dates in list(self._tf_buffer.items()):
+            for d in list(dates.keys()):
+                if not force and d == today:
+                    continue
+                to_flush.append((tf, d))
+
+        if not to_flush:
+            return
+
+        print(f"[FileWorker._flush_tf_buffer] Сброс {len(to_flush)} групп (force={force})...")
+        for tf, d in to_flush:
+            self._flush_tf_date(tf, d)
+
+    def _flush_tf_date(self, timeframe: str, d: date) -> None:
+        """Сбрасывает все бары конкретного (timeframe, date) на диск."""
+        sym_map = self._tf_buffer.get(timeframe, {}).get(d)
+        if not sym_map:
+            return
+
+        rows = []
+        for symbol, bars in sym_map.items():
+            for b in bars:
+                rows.append({
+                    "time": b["time"],
+                    "open": b["open"],
+                    "high": b["high"],
+                    "low": b["low"],
+                    "close": b["close"],
+                    "tick_volume": b.get("tick_volume", 0),
+                    "symbol": symbol,
+                })
+
+        if not rows:
+            return
+
+        df = pd.DataFrame(rows)
+        print(f"[FileWorker._flush_tf_date] {timeframe} {d}: "
+            f"{len(df)} строк, символов: {df['symbol'].nunique()}")
+
+        dt = datetime(d.year, d.month, d.day)
+        ok = HistoryManager.save_daily_parquet(
+            df=df,
+            date=dt,
+            base_dir=self.base_dir,
+            timeframe=timeframe,
+        )
+
+        if ok:
+            # Удаляем из буфера только после успешной записи
+            del self._tf_buffer[timeframe][d]
+            if not self._tf_buffer[timeframe]:
+                # Если словарь для tf опустел — удаляем tf
+                self._tf_buffer.pop(timeframe, None)
+
+            # Чистим _tf_current_date для этого (tf, *), если дата совпадает
+            for key in list(self._tf_current_date.keys()):
+                if key[0] == timeframe and self._tf_current_date[key] == d:
+                    del self._tf_current_date[key]
         else:
-            print("[FileWorker.wait_for_json_manager] Таймаут ожидания JsonManager")
-            return False
+            print(f"[FileWorker._flush_tf_date] Ошибка записи {timeframe} {d}, "
+                f"данные остаются в буфере")
+
+    def wait_for_ready(self, timeout=10) -> bool:
+        print("[FileWorker.wait_for_ready] Ожидание готовности FileWorker...")
+        if self._ready.wait(timeout=timeout):
+            print("[FileWorker.wait_for_ready] FileWorker готов")
+            return True
+        print("[FileWorker.wait_for_ready] Таймаут")
+        return False

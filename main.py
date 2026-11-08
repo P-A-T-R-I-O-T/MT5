@@ -2,15 +2,26 @@
 
 import time
 from src.core.system_orchestrator import SystemOrchestrator
+from config.settings import RUN
+from src.ai.training_orchestrator import TrainingOrchestrator
 
 
 def main():
     """Точка входа в программу."""
     print("1 [main] Запуск программы...")
+
     
-    print("2 [main] Создание SystemOrchestrator...")
-    orchestrator = SystemOrchestrator()
-    print("3 [main] SystemOrchestrator создан")
+    if RUN.mode == "live":
+        print("2 [main] Создание SystemOrchestrator...")
+        orchestrator = SystemOrchestrator()
+        print("3 [main] SystemOrchestrator создан")
+    elif RUN.mode == "train":
+        print("2.1 [main] Создание TrainingOrchestrator...")
+        orchestrator = TrainingOrchestrator()
+        print("3.1 [main] Создание TrainingOrchestrator создан")
+    else: raise ValueError("Не корректные настройки RUN")
+    
+
 
     try:
         print("4 [main] Запускаем SystemOrchestrator.start()")

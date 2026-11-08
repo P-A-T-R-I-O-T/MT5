@@ -2,8 +2,6 @@
 
 import MetaTrader5 as mt5
 import pandas as pd
-import threading
-import time
 from datetime import datetime, timezone
 
 class MT5Connection: # Упрощённый класс для подключения к MetaTrader 5
@@ -29,30 +27,28 @@ class MT5Connection: # Упрощённый класс для подключен
         print("[MT5Connection.__init__] Инициализация завершена")
 
     def _load_credentials(self):
-        """
-        Разбирает словарь self.credentials на отдельные атрибуты:
-        self.login, self.password, self.server.
-        
-        Данные приходят из JsonManager._credentials_cache через
-        SystemOrchestrator, поэтому повторное чтение файла не требуется.
-        """
+        """Разбирает credentials (dataclass или dict) на self.login/password/server."""
         print("[MT5Connection._load_credentials] Разбор credentials...")
-        credentials = self.credentials
-        print(f"[MT5Connection._load_credentials] Полученные данные: {credentials}")
+        creds = self.credentials
+        print(f"[MT5Connection._load_credentials] Полученные данные: {creds}")
 
-        if not credentials:
-            print("[MT5Connection._load_credentials] credentials пуст или None")
-            self.login = None
-            self.password = None
-            self.server = None
+        if not creds:
+            self.login = self.password = self.server = None
             return
 
         try:
-            # login приводим к int, т.к. в JSON он хранится строкой
-            raw_login = credentials.get('login')
+            if isinstance(creds, dict):
+                raw_login = creds.get('login')
+                password = creds.get('password')
+                server = creds.get('server')
+            else:
+                raw_login = getattr(creds, 'login', None)
+                password = getattr(creds, 'password', None)
+                server = getattr(creds, 'server', None)
+
             self.login = int(raw_login) if raw_login else None
-            self.password = credentials.get('password')
-            self.server = credentials.get('server')
+            self.password = password
+            self.server = server
 
             print(f"[MT5Connection._load_credentials] Логин: {self.login}")
             print(f"[MT5Connection._load_credentials] Сервер: {self.server}")
@@ -61,20 +57,14 @@ class MT5Connection: # Упрощённый класс для подключен
                 f"{'*' * len(str(self.password)) if self.password else 'None'}"
             )
 
-            # Проверяем, что все три поля заполнены
             if not all([self.login, self.password, self.server]):
                 print("[MT5Connection._load_credentials] Ошибка: не все данные указаны")
-                self.login = None
-                self.password = None
-                self.server = None
+                self.login = self.password = self.server = None
             else:
                 print("[MT5Connection._load_credentials] Все данные корректны")
-
         except (ValueError, TypeError) as e:
             print(f"[MT5Connection._load_credentials] Ошибка формата login: {e}")
-            self.login = None
-            self.password = None
-            self.server = None
+            self.login = self.password = self.server = None
 
             
     def connect(self): # Подключение к MT5
@@ -190,43 +180,53 @@ class MT5Connection: # Упрощённый класс для подключен
             self._is_connected = False
             return False
 
-    def get_server_time(self):
+    def get_server_time(self, symbol: str = None):
         """
-        Возвращает текущее время сервера MT5 (naive datetime).
-        Используется для расчёта диапазонов запросов.
+        Возвращает текущее время сервера MT5 (UTC-aware datetime).
+
+        Время берётся из последнего тика указанного символа.
+        Серверное время у MT5 одно на всех, поэтому символ нужен только
+        как источник «живого» тика.
+
+        :param symbol: имя символа. Если None — используется self._default_symbol,
+                    а если и он не задан — GBPUSD (крайний fallback).
         """
-        print("[MT5Connection.get_server_time] Получение серверного времени...")
+        print(f"[MT5Connection.get_server_time] Получение серверного времени...")
 
         if not self._is_connected:
             print("[MT5Connection.get_server_time] Не подключено к MT5")
             return None
 
+        # Определяем символ
+        if symbol is None:
+            symbol = getattr(self, "_default_symbol", None) or "GBPUSD"
+
         try:
-            # Берём последний тик любого доступного символа
-            # либо terminal_info().time — но надёжнее через тик
-            tick = mt5.symbol_info_tick("GBPUSD")
-            print(f"[MT5Connection.get_server_time] {tick}")
-            if tick is None or tick.time == 0:
-                # fallback — время терминала
-                info = mt5.terminal_info()
-                if info is None:
-                    print("[MT5Connection.get_server_time] Не удалось получить время")
-                    return None
-                server_time = datetime.fromtimestamp(info.time, tz=timezone.utc).replace(tzinfo=None)
+            tick = mt5.symbol_info_tick(symbol)
+            print(f"[MT5Connection.get_server_time] symbol={symbol}, tick={tick}")
 
-            else:
-                server_time = datetime.fromtimestamp(tick.time, tz=timezone.utc).replace(tzinfo=None)
+            if tick is not None and tick.time != 0:
+                server_time = datetime.fromtimestamp(tick.time, tz=timezone.utc)
+                print(f"[MT5Connection.get_server_time] Серверное время "
+                    f"(из {symbol}): {server_time}")
+                return server_time
 
-
-
-
-            print(f"\n\n\n\n[MT5Connection.get_server_time] Серверное время: server_time {server_time}")
+            # Fallback: время терминала
+            print(f"[MT5Connection.get_server_time] Нет тика по {symbol}, "
+                f"fallback на terminal_info().time")
+            info = mt5.terminal_info()
+            if info is None:
+                print("[MT5Connection.get_server_time] Не удалось получить время")
+                return None
+            server_time = datetime.fromtimestamp(info.time, tz=timezone.utc)
+            print(f"[MT5Connection.get_server_time] Серверное время "
+                f"(terminal_info): {server_time}")
             return server_time
 
         except Exception as e:
             print(f"[MT5Connection.get_server_time] Ошибка: {e}")
             return None
-
+    
     def warmup_symbol(self, symbol: str, timeframe: int, count: int = 2000) -> bool:
         """
         «Прогревает» историю символа в MT5.
@@ -255,6 +255,7 @@ class MT5Connection: # Упрощённый класс для подключен
 
             # 2. Запрашиваем последние бары — это заставит MT5 подгрузить историю
             rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+            
             if rates is None or len(rates) == 0:
                 print(f"[MT5Connection.warmup_symbol] {symbol}: не удалось получить бары для прогрева")
                 return False
@@ -288,8 +289,8 @@ class MT5Connection: # Упрощённый класс для подключен
         
         :param symbol_name: название символа
         :param timeframe: таймфрейм MT5 (mt5.TIMEFRAME_M1 и т.д.)
-        :param start_date: datetime объект с tzinfo (UTC)
-        :param end_date: datetime объект с tzinfo (UTC)
+        :param start_date: datetime объект (UTC-aware)
+        :param end_date: datetime объект (UTC-aware)
         :return: DataFrame с историческими данными или None
         """
         print(f"[MT5Connection.get_historical_data] Получение исторических данных для {symbol_name}...")
@@ -303,53 +304,47 @@ class MT5Connection: # Упрощённый класс для подключен
             return None
         
         try:
-            # 2. Обработка datetime — оставляем naive, MT5 работает в серверном времени
-            if start_date.tzinfo:
-                start_date_naive = start_date.replace(tzinfo=None)
-                print(f"[MT5Connection.get_historical_data] start_date преобразован в naive: {start_date_naive}")
+            # 2. Приводим datetime к UTC-aware (если пришли naive — считаем их UTC)
+            if start_date.tzinfo is None:
+                start_date = start_date.replace(tzinfo=timezone.utc)
             else:
-                start_date_naive = start_date
-                print(f"[MT5Connection.get_historical_data] start_date уже naive: {start_date_naive}")
+                start_date = start_date.astimezone(timezone.utc)
 
-            if end_date.tzinfo:
-                end_date_naive = end_date.replace(tzinfo=None)
-                print(f"[MT5Connection.get_historical_data] end_date преобразован в naive: {end_date_naive}")
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
             else:
-                end_date_naive = end_date
-                print(f"[MT5Connection.get_historical_data] end_date уже naive: {end_date_naive}")
+                end_date = end_date.astimezone(timezone.utc)
 
-            # 3. Убираем секунды и микросекунды для корректной работы MT5
-            start_date_naive = start_date_naive.replace(second=0, microsecond=0)
-            end_date_naive = end_date_naive.replace(second=0, microsecond=0)
-            print(f"[MT5Connection.get_historical_data] start_date после обработки: {start_date_naive}")
-            print(f"[MT5Connection.get_historical_data] end_date после обработки: {end_date_naive}")
+            print(f"[MT5Connection.get_historical_data] start_date (UTC): {start_date}")
+            print(f"[MT5Connection.get_historical_data] end_date   (UTC): {end_date}")
 
-            # 4. Вызов MT5 API
+            # 3. Вызов MT5 API — передаём UTC-aware datetime
             print("[MT5Connection.get_historical_data] Вызов mt5.copy_rates_range()...")
             rates = mt5.copy_rates_range(
                 symbol_name,
                 timeframe,
-                start_date_naive,
-                end_date_naive
+                start_date,
+                end_date
             )
 
-            # 4.1. Fallback: если диапазон пустой — пробуем через copy_rates_from_pos
+            # 4. Fallback: если диапазон пустой — пробуем через copy_rates_from_pos
             if rates is None or len(rates) == 0:
                 print(f"[MT5Connection.get_historical_data] copy_rates_range пуст, "
-                      f"пробуем copy_rates_from_pos (fallback)...")
+                    f"пробуем copy_rates_from_pos (fallback)...")
 
-                # Запрашиваем N последних баров и фильтруем по диапазону
+                # Запрашиваем N последних баров, начиная с позиции 1 (последний закрытый)
                 fallback_count = 10000  # достаточно для ~7 дней M1
-                rates_all = mt5.copy_rates_from_pos(symbol_name, timeframe, 0, fallback_count)
+                rates_all = mt5.copy_rates_from_pos(symbol_name, timeframe, 1, fallback_count)
 
                 if rates_all is not None and len(rates_all) > 0:
                     # Фильтруем по диапазону (time — в секундах, Unix timestamp)
-                    start_ts = int((start_date_naive - datetime(1970, 1, 1)).total_seconds())
-                    end_ts = int((end_date_naive - datetime(1970, 1, 1)).total_seconds())
+                    # Используем UTC-aware datetime для получения корректных timestamp
+                    start_ts = int(start_date.timestamp())
+                    end_ts = int(end_date.timestamp())
                     mask = (rates_all['time'] >= start_ts) & (rates_all['time'] <= end_ts)
                     rates = rates_all[mask]
                     print(f"[MT5Connection.get_historical_data] Fallback: "
-                          f"из {len(rates_all)} баров отфильтровано {len(rates)}")
+                        f"из {len(rates_all)} баров отфильтровано {len(rates)}")
                 else:
                     print(f"[MT5Connection.get_historical_data] Fallback тоже пуст")
 
@@ -363,13 +358,14 @@ class MT5Connection: # Упрощённый класс для подключен
             # 6. Создание DataFrame
             df = pd.DataFrame(rates)
 
-            # 7. Конвертация времени — БЕЗ utc=True, оставляем серверное время MT5
-            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True).dt.tz_localize(None)        
+            # 7. Конвертация времени (MT5 возвращает UTC — оставляем как есть, но для удобства
+            #    можно преобразовать в naive UTC для хранения)
+            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True).dt.tz_localize(None)
+
             # 8. Сортировка колонок в нужном порядке
             cols_order = ['time', 'open', 'high', 'low', 'close', 
                         'tick_volume', 'spread', 'real_volume']
             
-            # Проверяем наличие всех колонок
             available_cols = [col for col in cols_order if col in df.columns]
             if available_cols:
                 df = df[available_cols]

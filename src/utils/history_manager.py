@@ -2,11 +2,12 @@
 
 import os
 import pandas as pd
-import MetaTrader5 as mt5
+#import MetaTrader5 as mt5
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
-from src.utils.file_checker import TIMEFRAME_MAPPING
+#from typing import Optional
+# from src.utils.file_checker import TIMEFRAME_MAPPING
+from src.utils.file_checker import REAL_CSV_COLUMNS
 
 class HistoryManager:
 
@@ -20,8 +21,7 @@ class HistoryManager:
         """
         print(f"[HistoryManager.reset_real_csv] Создание/перезапись файла: {filename}")
 
-        required_columns = ['time', 'open', 'high', 'low', 'close',
-                            'tick_volume', 'spread', 'real_volume', 'symbol']
+        required_columns = REAL_CSV_COLUMNS
         print(f"[HistoryManager.reset_real_csv] Колонки: {required_columns}")
 
         try:
@@ -71,7 +71,7 @@ class HistoryManager:
         try:
             # 1. Готовим новые данные
             df_new = df.copy()
-            df_new['time'] = df_new['time'].dt.strftime('%d-%m-%Y %H:%M:%S')
+            df_new['time'] = df_new['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
             print(f"[HistoryManager.append_to_real_csv] Первые новые записи: {df_new.head(3)}")
 
             # 2. Читаем существующий файл (если есть)
@@ -85,6 +85,7 @@ class HistoryManager:
 
             # 3. Объединяем
             combined = pd.concat([df_existing, df_new], ignore_index=True)
+            combined = combined[REAL_CSV_COLUMNS]          # ← выравниваем порядок колонок
 
             # 4. Сортируем по (time, symbol) — тот же порядок, что в save_daily_data_avro
             print("[HistoryManager.append_to_real_csv] Сортировка по (time, symbol)...")
@@ -117,53 +118,116 @@ class HistoryManager:
             return False
 
     @staticmethod
-    def save_daily_data_avro(df: pd.DataFrame, date: datetime, base_dir: Path):
-        """Сохраняет дневные данные в AVRO файл с форматом DD-MM-YYYY (все символы в одном файле)"""
-        print(f"[HistoryManager.save_daily_data_avro] Сохранение дневных данных за {date}...")
-        print(f"[HistoryManager.save_daily_data_avro] Размер DataFrame: {df.shape}")
-        print(f"[HistoryManager.save_daily_data_avro] Базовая директория: {base_dir}")
-        
-        date_str = date.strftime('%Y-%m-%d')
-        file_path = base_dir / f"{date_str}.avro"
-        print(f"[HistoryManager.save_daily_data_avro] Путь к файлу: {file_path}")
-        
-        # Конвертируем время в строку для AVRO
-        print("[HistoryManager.save_daily_data_avro] Конвертация времени в строку...")
-        df_display = df.copy()
-        df_display['time'] = df_display['time'].dt.strftime('%d-%m-%Y %H:%M:%S')
-        print(f"[HistoryManager.save_daily_data_avro] Первые записи: {df_display.head()}")
-        
-        try:
-            if file_path.exists():
-                print(f"[HistoryManager.save_daily_data_avro] Файл {file_path} существует, объединение...")
-                # Читаем существующий файл
-                existing_df = pd.read_parquet(file_path)
-                print(f"[HistoryManager.save_daily_data_avro] Существующие данные: {existing_df.shape}")
-                
-                # Объединяем с новыми данными
-                combined_df = pd.concat([existing_df, df_display], ignore_index=True)
-                print(f"[HistoryManager.save_daily_data_avro] Объединенные данные: {combined_df.shape}")
-                
-                # Удаляем дубликаты по времени и символу
-                combined_df.drop_duplicates(subset=['time', 'symbol'], keep='last', inplace=True)
-                print(f"[HistoryManager.save_daily_data_avro] После удаления дубликатов: {combined_df.shape}")
-                
-                # Сортируем по времени и символу
-                combined_df = combined_df.sort_values(['time', 'symbol'])
-                print("[HistoryManager.save_daily_data_avro] Данные отсортированы")
-                
-                print("[HistoryManager.save_daily_data_avro] Сохранение в parquet...")
-                combined_df.to_parquet(file_path, engine='pyarrow', index=False)
-            else:
-                print(f"[HistoryManager.save_daily_data_avro] Файл {file_path} не существует, создание нового...")
-                # Сортируем перед сохранением
-                df_display = df_display.sort_values(['time', 'symbol'])
-                print("[HistoryManager.save_daily_data_avro] Данные отсортированы")
-                
-                print("[HistoryManager.save_daily_data_avro] Сохранение в parquet...")
-                df_display.to_parquet(file_path, engine='pyarrow', index=False)
-            
-            print(f"[HistoryManager.save_daily_data_avro] Данные за {date_str} сохранены в {file_path} (всего записей: {len(df_display)})")
-        except Exception as e:
-            print(f"[HistoryManager.save_daily_data_avro] Ошибка при сохранении данных за {date_str}: {e}")
+    def save_daily_parquet(
+        df: pd.DataFrame,
+        date: datetime,
+        base_dir: Path,
+        timeframe: str,
+    ) -> bool:
+        """
+        Сохраняет бары за день в history/<timeframe>/YYYY-MM-DD.parquet.
 
+        Используется и для M1, и для старших ТФ (M5, M15, H1, D1).
+        Сортировка: (symbol, time).
+        Перезаписывает файл целиком (атомарно).
+
+        :param df: DataFrame с колонками time, open, high, low, close,
+                tick_volume, symbol
+        :param date: дата
+        :param base_dir: корень history/
+        :param timeframe: 'M1' | 'M5' | 'M15' | 'H1' | 'D1'
+        """
+        print(f"[HistoryManager.save_daily_parquet] {timeframe} за {date}...")
+
+        if df is None or df.empty:
+            print("[HistoryManager.save_daily_parquet] Пустой DataFrame, пропуск")
+            return False
+
+        tf_dir = base_dir / timeframe
+        date_str = date.strftime('%Y-%m-%d')
+        file_path = tf_dir / f"{date_str}.parquet"
+        tmp_path = tf_dir / f"{date_str}.parquet.tmp"
+
+        # 1. Готовим данные
+        df_display = df.copy()
+        df_display['time'] = pd.to_datetime(df_display['time'])
+        df_display['time'] = df_display['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Сортировка по (symbol, time)
+        if 'symbol' in df_display.columns:
+            df_display = df_display.sort_values(['symbol', 'time']).reset_index(drop=True)
+        else:
+            df_display = df_display.sort_values(['time']).reset_index(drop=True)
+
+        try:
+            tf_dir.mkdir(parents=True, exist_ok=True)
+
+            with open(tmp_path, 'wb') as f:
+                df_display.to_parquet(f, engine='pyarrow', index=False)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_path, file_path)
+            print(f"[HistoryManager.save_daily_parquet] Записано {len(df_display)} строк "
+                f"в {file_path}")
+            return True
+
+        except Exception as e:
+            print(f"[HistoryManager.save_daily_parquet] Ошибка: {e}")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            return False
+
+    @staticmethod
+    def append_to_single_parquet(df: pd.DataFrame, file_path: Path) -> bool:
+        """
+        Идемпотентно добавляет данные в один общий parquet-файл (для D1).
+        Дедуп по (symbol, time): при повторе запись перезаписывается свежей.
+        """
+        print(f"[HistoryManager.append_to_single_parquet] {file_path}")
+        if df is None or df.empty:
+            return False
+
+        try:
+            df_new = df.copy()
+            df_new['time'] = pd.to_datetime(df_new['time'])
+            df_new['time'] = df_new['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+            if file_path.exists():
+                df_existing = pd.read_parquet(file_path)
+                if 'time' in df_existing.columns:
+                    df_existing['time'] = pd.to_datetime(df_existing['time'])
+                    df_existing['time'] = df_existing['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                combined = pd.concat([df_existing, df_new], ignore_index=True)
+            else:
+                combined = df_new
+
+            combined = combined.drop_duplicates(subset=['symbol', 'time'], keep='last')
+            if 'symbol' in combined.columns:
+                combined = combined.sort_values(['symbol', 'time']).reset_index(drop=True)
+            else:
+                combined = combined.sort_values(['time']).reset_index(drop=True)
+
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = file_path.with_suffix(file_path.suffix + '.tmp')
+            with open(tmp_path, 'wb') as f:
+                combined.to_parquet(f, engine='pyarrow', index=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, file_path)
+            print(f"[HistoryManager.append_to_single_parquet] "
+                f"Записано {len(df_new)} новых, всего {len(combined)}")
+            return True
+
+        except Exception as e:
+            print(f"[HistoryManager.append_to_single_parquet] Ошибка: {e}")
+            try:
+                tmp_path = file_path.with_suffix(file_path.suffix + '.tmp')
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            return False

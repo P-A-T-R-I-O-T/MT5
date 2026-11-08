@@ -68,6 +68,13 @@ class WorkerMT5:
         # --- Мониторинг подключения ---
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitoring_active = False
+
+        # --- Символ по умолчанию для get_server_time ---
+        history_settings = self.settings.get('history', {})
+        history_symbols = history_settings.get('symbols', [])
+        self._default_symbol = history_symbols[0] if history_symbols else "GBPUSD"
+        self.mt5_conn._default_symbol = self._default_symbol
+        print(f"[WorkerMT5.__init__] _default_symbol = {self._default_symbol}")
         
         print("[WorkerMT5.__init__] Инициализация завершена")
 
@@ -240,7 +247,8 @@ class WorkerMT5:
 
         elif t_type == "get_server_time":
             print("[WorkerMT5._execute_task] Получение серверного времени...")
-            server_time = self.mt5_conn.get_server_time()
+            symbol = task.payload.get("symbol") or self._default_symbol
+            server_time = self.mt5_conn.get_server_time(symbol=symbol)
             print(f"[WorkerMT5._execute_task] Серверное время: {server_time}")
 
             if task.result_callback:
@@ -394,23 +402,36 @@ class WorkerMT5:
         print("[WorkerMT5._initialize_system] Инициализация завершена (_init_done=True)")
         
     def _handle_symbols_comparison(self, res):
-        """Обработка результата сравнения списка символов."""
         comparison = res.get('comparison', {})
         added = comparison.get('added', [])
         removed = comparison.get('removed', [])
         unchanged = comparison.get('unchanged', [])
 
         print("\n[WorkerMT5._handle_symbols_comparison] Результат сравнения символов:")
-        print(f"  Было в symbols_list.json: {comparison.get('old_count', 0)}")
-        print(f"  Пришло от MT5:            {comparison.get('new_count', 0)}")
-        print(f"  Новых (added):            {len(added)}")
-        print(f"  Пропали (removed):        {len(removed)}")
-        print(f"  Без изменений:            {len(unchanged)}")
-
+        print(f"  Было в symbols_list.txt: {comparison.get('old_count', 0)}")
+        print(f"  Пришло от MT5:           {comparison.get('new_count', 0)}")
+        print(f"  Новых (added):           {len(added)}")
+        print(f"  Пропали (removed):       {len(removed)}")
+        print(f"  Без изменений:           {len(unchanged)}")
         if added:
             print(f"  +++ Новые символы: {added}")
         if removed:
             print(f"  --- Пропавшие символы: {removed}")
+
+        # Сохраняем новый полный список в symbols_list.txt
+        all_new = comparison.get('all_new', [])
+        if all_new:
+            self.file_worker.submit(FileTask(
+                task_type="save_symbols",
+                payload={"symbols": all_new},
+                result_callback=lambda r: print(
+                    f"[WorkerMT5._handle_symbols_comparison] Символы сохранены: "
+                    f"{r.get('count', 0)} шт."
+                ),
+                error_callback=lambda e: print(
+                    f"[WorkerMT5._handle_symbols_comparison] Ошибка сохранения: {e}"
+                ),
+            ))
     
 
     def _connect_to_mt5(self) -> bool:
@@ -435,25 +456,21 @@ class WorkerMT5:
         Прогревает историю для символов, которые будут собираться в real.csv.
         Без этого copy_rates_range может вернуть пусто для длинных диапазонов.
         """
-        print("\n[WorkerMT5._warmup_history_symbols] Прогрев истории для символов из настроек...")
 
+        print("\n[WorkerMT5._warmup_history_symbols] Прогрев истории по всем ТФ...")
         history_settings = self.settings.get('history', {})
         symbols = history_settings.get('symbols', [])
-        timeframe_str = history_settings.get('timeframe', 'M1')
+        timeframes = history_settings.get('timeframes', ['M1'])
 
-        # Импортируем TIMEFRAME_MAPPING локально, чтобы не плодить зависимости
         from src.utils.file_checker import TIMEFRAME_MAPPING
-        timeframe = TIMEFRAME_MAPPING.get(timeframe_str)
-        if timeframe is None:
-            print(f"[WorkerMT5._warmup_history_symbols] Неизвестный таймфрейм: {timeframe_str}")
-            return
-
-        print(f"[WorkerMT5._warmup_history_symbols] Символы: {symbols}")
-        print(f"[WorkerMT5._warmup_history_symbols] Таймфрейм: {timeframe}")
-
-        for symbol in symbols:
-            self.mt5_conn.warmup_symbol(symbol, timeframe, count=5000)
-
+        for tf_str in timeframes:
+            tf = TIMEFRAME_MAPPING.get(tf_str)
+            if tf is None:
+                continue
+            # для D1 хватит 500 баров; для M1 — 5000
+            count = 500 if tf_str == 'D1' else 5000
+            for symbol in symbols:
+                self.mt5_conn.warmup_symbol(symbol, tf, count=count)
         print("[WorkerMT5._warmup_history_symbols] Прогрев завершён")
 
     def _start_monitoring(self):
