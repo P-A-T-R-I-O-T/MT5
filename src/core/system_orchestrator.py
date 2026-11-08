@@ -644,7 +644,7 @@ class SystemOrchestrator:
         retry_timer.start()
                 
     def _save_current_bars(self, res, tf_str: str = "M1"):
-        print(f"[SystemOrchestrator._save_current_bars {tf_str}] Сохранение...")
+        print(f"[_save_current_bars {tf_str}] Сохранение...")
         if res.get('data') is None or res['data'].empty:
             return
 
@@ -652,38 +652,29 @@ class SystemOrchestrator:
         if 'timeframe' not in df.columns:
             df['timeframe'] = tf_str
 
-        self.file_worker.submit(FileTask(
-            task_type="save_to_real_csv",
-            payload={
-                "data": df,
-                "filename": self.output_file,
-                "timeframe": tf_str,
-            },
-            result_callback=lambda r: None,
-            error_callback=lambda e: print(
-                f"[_save_current_bars {tf_str}] Ошибка: {e}"
-            ),
-        ))
+        # В real.csv — ТОЛЬКО M1 (правило хранения)
+        if tf_str == "M1":
+            self.file_worker.submit(FileTask(
+                task_type="save_to_real_csv",
+                payload={"data": df, "filename": self.output_file, "timeframe": "M1"},
+                result_callback=lambda r: None,
+                error_callback=lambda e: print(f"[_save_current_bars M1] Ошибка: {e}"),
+            ))
 
-        # В BarStateWorker — только M1, и только если он создан (AI.enabled=True).
-        if tf_str == "M1" and self.bar_state_worker is not None:
-            for _, row in df.iterrows():
-                self.bar_state_worker.submit_m1(row["symbol"], {
-                    "time": row["time"],
-                    "open": float(row["open"]), "high": float(row["high"]),
-                    "low": float(row["low"]),   "close": float(row["close"]),
-                    "tick_volume": int(row.get("tick_volume", 0)),
-                })
+            if self.bar_state_worker is not None:
+                for _, row in df.iterrows():
+                    self.bar_state_worker.submit_m1(row["symbol"], {
+                        "time": row["time"],
+                        "open": float(row["open"]), "high": float(row["high"]),
+                        "low": float(row["low"]),   "close": float(row["close"]),
+                        "tick_volume": int(row.get("tick_volume", 0)),
+                    })
 
     def _on_tf_close_callback(self, symbol: str, timeframe: str, bar: dict) -> None:
-        """
-        Вызывается BarStateWorker при закрытии старшего ТФ.
-        Отправляет бар в FileWorker как save_tf_bar.
-        """
-        print(f"[SystemOrchestrator._on_tf_close_callback] "
-            f"{symbol} {timeframe} закрыт @ {bar.get('time')} "
-            f"O={bar['open']} H={bar['high']} L={bar['low']} "
-            f"C={bar['close']} V={bar['tick_volume']}")
+        """Лог закрытого старшего ТФ. Архив идёт нативно из MT5,
+        поэтому save_tf_bar больше не вызывается."""
+        print(f"[_on_tf_close_callback] {symbol} {timeframe} закрыт @ "
+            f"{bar.get('time')} C={bar['close']} V={bar['tick_volume']}")
 
         self.file_worker.submit(FileTask(
             task_type="save_tf_bar",

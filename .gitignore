@@ -3,7 +3,8 @@ history/
 test/
 __pycache__/
 logs/
-credentials.json
+eserve_json/
+credentials.py
 credentials.txt
 данные.txt
 project.txt

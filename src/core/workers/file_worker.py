@@ -6,10 +6,6 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 import pandas as pd
-import time 
-
-from collections import defaultdict
-
 
 from src.utils.history_manager import HistoryManager
 from src.utils.symbols_manager import (
@@ -18,6 +14,7 @@ from src.utils.symbols_manager import (
     compare_symbols as _compare_symbols,
 )
 from config.settings import SYMBOLS_LIST_PATH
+
 
 @dataclass
 class FileTask:
@@ -43,18 +40,6 @@ class FileWorker:
         self.base_dir = pathlib.Path('F:/MT5-soft/history')
         self._last_written_time: Dict[str, datetime] = {}
 
-        # --- Буфер для старших ТФ: {tf: {date: {symbol: [bar_dict, ...]}}} ---
-        self._tf_buffer: Dict[str, Dict[date, Dict[str, list]]] = defaultdict(
-            lambda: defaultdict(lambda: defaultdict(list))
-        )
-
-        # Для каждого (tf, symbol) запоминаем текущую дату, чтобы понять,
-        # когда нужно сбросить вчерашний день
-        self._tf_current_date: Dict[tuple, date] = {}
-
-        # Время последнего flush по таймеру
-        self._tf_last_flush_ts = time.time()
-        self._tf_flush_interval_sec = 60  # раз в минуту
 
         print("2 [FileWorker.__init__] Инициализация завершена")
 
@@ -73,10 +58,6 @@ class FileWorker:
 
     def stop(self):
         print("[FileWorker.stop] Остановка FileWorker...")
-
-        # Принудительный сброс буферов старших ТФ
-        print("[FileWorker.stop] Финальный сброс буферов старших ТФ...")
-        self._flush_tf_buffer(force=True)
 
         self._stop_flag = True
         self._is_running = False
@@ -103,11 +84,6 @@ class FileWorker:
         processed_tasks = 0
         
         while not self._stop_flag:
-            # Периодический flush старших ТФ (только для прошедших дней)
-            now = time.time()
-            if now - self._tf_last_flush_ts >= self._tf_flush_interval_sec:
-                self._flush_tf_buffer(force=False)
-                self._tf_last_flush_ts = now
             try:
                 task = self._queue.get(timeout=0.5)
                 print(f"[FileWorker._run_loop] Получена задача: {task.task_type}")
@@ -199,55 +175,6 @@ class FileWorker:
                     if task.result_callback:
                         task.result_callback({"status": "error"})
 
-        elif t_type == "save_tf_bar":
-            print("[FileWorker._execute_task] Буферизация закрытого бара старшего ТФ...")
-            symbol = task.payload.get('symbol')
-            timeframe = task.payload.get('timeframe')
-            bar = task.payload.get('bar')
-
-            if not all([symbol, timeframe, bar]):
-                msg = "save_tf_bar: нужны symbol, timeframe, bar"
-                print(f"[FileWorker._execute_task] Ошибка: {msg}")
-                if task.error_callback:
-                    task.error_callback(ValueError(msg))
-                return
-
-            if timeframe not in ("M5", "M15", "H1", "D1"):
-                msg = f"save_tf_bar: неподдерживаемый timeframe {timeframe}"
-                print(f"[FileWorker._execute_task] Ошибка: {msg}")
-                if task.error_callback:
-                    task.error_callback(ValueError(msg))
-                return
-
-            bar_time = bar.get('time')
-            if bar_time is None:
-                msg = "save_tf_bar: бар без time"
-                print(f"[FileWorker._execute_task] Ошибка: {msg}")
-                if task.error_callback:
-                    task.error_callback(ValueError(msg))
-                return
-
-            if isinstance(bar_time, pd.Timestamp):
-                bar_time = bar_time.to_pydatetime()
-            bar_date = bar_time.date()
-
-            # Кладём в буфер
-            self._tf_buffer[timeframe][bar_date][symbol].append(dict(bar, symbol=symbol))
-
-            # Если для этого (tf, symbol) уже есть другая дата — сбрасываем её
-            key = (timeframe, symbol)
-            prev_date = self._tf_current_date.get(key)
-            if prev_date is not None and prev_date != bar_date:
-                # Сбрасываем прошедшую дату
-                self._flush_tf_date(timeframe, prev_date)
-
-            self._tf_current_date[key] = bar_date
-
-            print(f"[FileWorker._execute_task] Буферизован {symbol} {timeframe} @ {bar_time}")
-
-            if task.result_callback:
-                task.result_callback({"status": "buffered"})
-
         elif t_type == "append_to_single_parquet":
             df = task.payload.get('data')
             file_path = task.payload.get('file_path')
@@ -325,79 +252,6 @@ class FileWorker:
                 print("[FileWorker._execute_task] error_callback выполнен")
         
         print(f"[FileWorker._execute_task] Завершение выполнения задачи: {t_type}")
-
-    def _flush_tf_buffer(self, force: bool) -> None:
-        """
-        Сбрасывает буферы старших ТФ на диск.
-
-        force=True  — сбрасываем ВСЁ, включая текущий день.
-        force=False — только прошедшие дни (текущий оставляем).
-        """
-        today = datetime.now(timezone.utc).date()
-
-        # Собираем список (tf, date) для сброса
-        to_flush = []
-        for tf, dates in list(self._tf_buffer.items()):
-            for d in list(dates.keys()):
-                if not force and d == today:
-                    continue
-                to_flush.append((tf, d))
-
-        if not to_flush:
-            return
-
-        print(f"[FileWorker._flush_tf_buffer] Сброс {len(to_flush)} групп (force={force})...")
-        for tf, d in to_flush:
-            self._flush_tf_date(tf, d)
-
-    def _flush_tf_date(self, timeframe: str, d: date) -> None:
-        """Сбрасывает все бары конкретного (timeframe, date) на диск."""
-        sym_map = self._tf_buffer.get(timeframe, {}).get(d)
-        if not sym_map:
-            return
-
-        rows = []
-        for symbol, bars in sym_map.items():
-            for b in bars:
-                rows.append({
-                    "time": b["time"],
-                    "open": b["open"],
-                    "high": b["high"],
-                    "low": b["low"],
-                    "close": b["close"],
-                    "tick_volume": b.get("tick_volume", 0),
-                    "symbol": symbol,
-                })
-
-        if not rows:
-            return
-
-        df = pd.DataFrame(rows)
-        print(f"[FileWorker._flush_tf_date] {timeframe} {d}: "
-            f"{len(df)} строк, символов: {df['symbol'].nunique()}")
-
-        dt = datetime(d.year, d.month, d.day)
-        ok = HistoryManager.save_daily_parquet(
-            df=df,
-            date=dt,
-            base_dir=self.base_dir,
-            timeframe=timeframe,
-        )
-
-        if ok:
-            # Удаляем из буфера только после успешной записи
-            del self._tf_buffer[timeframe][d]
-            if not self._tf_buffer[timeframe]:
-                # Если словарь для tf опустел — удаляем tf
-                self._tf_buffer.pop(timeframe, None)
-
-            # Чистим _tf_current_date для этого (tf, *), если дата совпадает
-            for key in list(self._tf_current_date.keys()):
-                if key[0] == timeframe and self._tf_current_date[key] == d:
-                    del self._tf_current_date[key]
-        else:
-            print(f"[FileWorker._flush_tf_date] Ошибка записи {timeframe} {d}, "
-                f"данные остаются в буфере")
 
     def wait_for_ready(self, timeout=10) -> bool:
         print("[FileWorker.wait_for_ready] Ожидание готовности FileWorker...")

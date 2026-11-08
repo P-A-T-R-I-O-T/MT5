@@ -58,11 +58,8 @@ class HistorySettings:
 
 @dataclass
 class AISettings:
-    # ВНИМАНИЕ: если включить AI.enabled=True, BarStateWorker начнёт
-    # агрегировать M1→M5/M15/H1/D1 и писать их в history/<TF>/*.parquet —
-    # это будет конфликтовать с прямым сбором из MT5 (см. _collection_loop_tf).
-    # Не включать без переработки BarStateWorker.
-    enabled: bool = False
+
+    enabled: bool = True  # False
     seq_len: int = 60
     horizon: int = 15
     stride: int = 5
