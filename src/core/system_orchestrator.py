@@ -685,7 +685,8 @@ class SystemOrchestrator:
                 error_callback=lambda e: print(f"[_save_current_bars M1] Ошибка: {e}"),
             ))
 
-            if self.bar_state_worker is not None:
+            # В BarStateWorker — только одиночные (живые) M1, не бэкфилл
+            if self.bar_state_worker is not None and len(df) == 1:
                 for _, row in df.iterrows():
                     self.bar_state_worker.submit_m1(row["symbol"], {
                         "time": row["time"],
