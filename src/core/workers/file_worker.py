@@ -243,6 +243,30 @@ class FileWorker:
             else:
                 print("[FileWorker._execute_task] Ошибка: filename не указан")
         
+        elif t_type == "upsert_daily_parquet":
+            print("[FileWorker._execute_task] Upsert дневного parquet...")
+            data = task.payload.get('data')
+            date = task.payload.get('date')
+            base_dir = task.payload.get('base_dir', self.base_dir)
+            timeframe = task.payload.get('timeframe', 'M1')
+
+            print(f"[FileWorker._execute_task] Дата: {date}, ТФ: {timeframe}, "
+                f"Данные: {data.shape if data is not None else 'None'}")
+
+            if data is not None and not data.empty and date:
+                success = HistoryManager.upsert_daily_parquet(
+                    df=data, date=date, base_dir=base_dir, timeframe=timeframe
+                )
+                if task.result_callback:
+                    task.result_callback({
+                        "status": "saved" if success else "error",
+                        "date": date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date),
+                    })
+            else:
+                print("[FileWorker._execute_task] Ошибка: data пустые или date не указана")
+                if task.result_callback:
+                    task.result_callback({"status": "error"})
+        
         else:
             msg = f"[FileWorker._execute_task] Неизвестный тип задачи: {t_type}"
             print(msg)

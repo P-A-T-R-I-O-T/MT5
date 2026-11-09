@@ -231,3 +231,65 @@ class HistoryManager:
             except Exception:
                 pass
             return False
+
+    @staticmethod
+    def upsert_daily_parquet(df: pd.DataFrame, date, base_dir: Path, timeframe: str) -> bool:
+        """
+        Идемпотентно сохраняет/обновляет данные за день в history/<TF>/YYYY-MM-DD.parquet.
+
+        Отличие от save_daily_parquet:
+        - save_daily_parquet полностью ПЕРЕЗАПИСЫВАЕТ файл;
+        - upsert_daily_parquet ЧИТАЕТ существующий файл, сливает,
+            дедуплицирует по (symbol, time) и атомарно пишет обратно.
+
+        Используется для «сегодняшнего» дня, где данные поступают порциями
+        по мере закрытия баров. В конце дня _finalize_day_end делает
+        save_daily_parquet с полным днём — он перезапишет эту «частичную» версию.
+        """
+        print(f"[HistoryManager.upsert_daily_parquet] {timeframe} за {date}...")
+        if df is None or df.empty:
+            return False
+
+        tf_dir = base_dir / timeframe
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        file_path = tf_dir / f"{date_str}.parquet"
+        tmp_path = tf_dir / f"{date_str}.parquet.tmp"
+
+        try:
+            df_new = df.copy()
+            df_new['time'] = pd.to_datetime(df_new['time'])
+            df_new['time'] = df_new['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+            if file_path.exists():
+                df_existing = pd.read_parquet(file_path)
+                if 'time' in df_existing.columns:
+                    df_existing['time'] = pd.to_datetime(df_existing['time'])
+                    df_existing['time'] = df_existing['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                combined = pd.concat([df_existing, df_new], ignore_index=True)
+            else:
+                combined = df_new
+
+            combined = combined.drop_duplicates(subset=['symbol', 'time'], keep='last')
+            if 'symbol' in combined.columns:
+                combined = combined.sort_values(['symbol', 'time']).reset_index(drop=True)
+            else:
+                combined = combined.sort_values(['time']).reset_index(drop=True)
+
+            tf_dir.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, 'wb') as f:
+                combined.to_parquet(f, engine='pyarrow', index=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, file_path)
+            print(f"[HistoryManager.upsert_daily_parquet] "
+                f"Записано {len(df_new)} новых, всего {len(combined)} в {file_path}")
+            return True
+
+        except Exception as e:
+            print(f"[HistoryManager.upsert_daily_parquet] Ошибка: {e}")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            return False

@@ -447,7 +447,7 @@ class SystemOrchestrator:
                 prev_day = current_day
             except Exception as e:
                 print(f"[_day_end_watchdog] Ошибка: {e}")
-            time.sleep(20)
+            time.sleep(60)
         print("[_day_end_watchdog] Остановлен")
 
     def _on_day_end(self, date):
@@ -652,7 +652,31 @@ class SystemOrchestrator:
         if 'timeframe' not in df.columns:
             df['timeframe'] = tf_str
 
-        # В real.csv — ТОЛЬКО M1 (правило хранения)
+        # Определяем дату по первому бару (все бары в пакете — за один день)
+        try:
+            date = pd.to_datetime(df['time'].iloc[0]).date()
+        except Exception as e:
+            print(f"[_save_current_bars {tf_str}] Не удалось определить дату: {e}")
+            return
+
+        # --- 1. Для ВСЕХ обычных ТФ — upsert в history/<TF>/YYYY-MM-DD.parquet
+        single_file = set(self.history_settings.get('single_file_timeframes', []))
+        if tf_str not in single_file:
+            self.file_worker.submit(FileTask(
+                task_type="upsert_daily_parquet",
+                payload={
+                    "data": df,
+                    "date": date,
+                    "base_dir": self.base_dir,
+                    "timeframe": tf_str,
+                },
+                result_callback=lambda r, t=tf_str: None,
+                error_callback=lambda e, t=tf_str: print(
+                    f"[_save_current_bars {t}] Ошибка upsert: {e}"
+                ),
+            ))
+
+        # --- 2. M1 — дополнительно в real.csv и в BarStateWorker
         if tf_str == "M1":
             self.file_worker.submit(FileTask(
                 task_type="save_to_real_csv",
@@ -665,29 +689,22 @@ class SystemOrchestrator:
                 for _, row in df.iterrows():
                     self.bar_state_worker.submit_m1(row["symbol"], {
                         "time": row["time"],
-                        "open": float(row["open"]), "high": float(row["high"]),
-                        "low": float(row["low"]),   "close": float(row["close"]),
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
                         "tick_volume": int(row.get("tick_volume", 0)),
                     })
 
     def _on_tf_close_callback(self, symbol: str, timeframe: str, bar: dict) -> None:
-        """Лог закрытого старшего ТФ. Архив идёт нативно из MT5,
-        поэтому save_tf_bar больше не вызывается."""
+        """Лог закрытого старшего ТФ.
+
+        Персист закрытых M5/M15/H1 идёт нативно из MT5 через _collection_loop_tf
+        и _save_current_bars → upsert_daily_parquet.
+        D1 персистится отдельно в day-end через append_to_single_parquet.
+        """
         print(f"[_on_tf_close_callback] {symbol} {timeframe} закрыт @ "
             f"{bar.get('time')} C={bar['close']} V={bar['tick_volume']}")
-
-        self.file_worker.submit(FileTask(
-            task_type="save_tf_bar",
-            payload={
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "bar": bar,
-            },
-            result_callback=lambda r: None,
-            error_callback=lambda e: print(
-                f"[SystemOrchestrator._on_tf_close_callback] Ошибка: {e}"
-            ),
-        ))
 
     def _user_input_loop(self):
         """Цикл обработки пользовательского ввода."""

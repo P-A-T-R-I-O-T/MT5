@@ -35,7 +35,7 @@ class DisplaySettings:
 @dataclass
 class HistorySettings:
     enabled: bool = True
-    start_date: datetime = datetime(2026, 10, 14)
+    start_date: datetime = datetime(2026, 10, 29)
     symbols: list = field(
         default_factory=lambda: ["GBPUSD"]  # ["GBPUSD", "BTCUSD"]
     )
